@@ -4,3 +4,7 @@ dist-newstyle/
 *.o
 cabal.project.local
 cabal.project.local~
+
+# Nix
+result
+result-*

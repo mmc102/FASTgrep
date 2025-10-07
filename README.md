@@ -5,6 +5,14 @@
 
 ## Installation
 
+
+### homebrew
+
+`brew tap mmc102/fastgrep`
+`brew install fastgrep`
+
+### build from source
+
 `cabal build`
 
 `cabal install --install-method=copy --overwrite-policy=always`

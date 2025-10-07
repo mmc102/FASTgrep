@@ -2,9 +2,12 @@
 
 module Main where
 
-import Control.Monad (filterM, forM_, when)
+import Control.DeepSeq (force)
+import Control.Exception (evaluate)
+import Control.Monad (filterM, forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BS8
 import Data.List (isPrefixOf, isSuffixOf)
 import Data.Maybe (catMaybes)
 import Matcher
@@ -17,12 +20,14 @@ import System.Exit (exitSuccess, exitWith)
 import System.FilePath (takeExtension, takeFileName)
 import System.FilePath qualified as FP
 import System.IO (hFlush, stdout)
+import TUI (MatchWithContext (..), ResultsAction (..), SearchParams (..), runInteractiveTUI, runSearchResultsTUI, spExtensions, spPath, spPattern, spSearchTypes)
 
 data Options = Options
-  { searchPattern :: String,
+  { searchPattern :: Maybe String,
     searchTypes :: [SearchType],
     targetPath :: FilePath,
-    fileExtensions :: [String]
+    fileExtensions :: [String],
+    tuiMode :: Bool
   }
   deriving (Show)
 
@@ -40,10 +45,11 @@ searchTypeParser =
 optionsParser :: Parser Options
 optionsParser =
   Options
-    <$> strArgument (metavar "PATTERN" <> help "The pattern to search for")
+    <$> optional (strArgument (metavar "PATTERN" <> help "The pattern to search for"))
     <*> searchTypeParser
     <*> strOption (long "path" <> short 'p' <> value "." <> metavar "PATH" <> help "Path to search (file or directory)")
     <*> many (strOption (long "ext" <> short 'e' <> metavar "EXT" <> help "File extension to search (e.g., .py, .tsx). Can be specified multiple times."))
+    <*> switch (long "tui" <> short 't' <> help "Launch interactive TUI mode")
 
 main :: IO ()
 main = do
@@ -107,15 +113,131 @@ printBanner = do
 
 runSearch :: Options -> IO ()
 runSearch opts = do
-  isFile <- doesFileExist (targetPath opts)
-  isDir <- doesDirectoryExist (targetPath opts)
+  case searchPattern opts of
+    Nothing -> runInteractiveSearchLoop opts  -- Launch interactive TUI when no pattern
+    Just pattern -> do
+      isFile <- doesFileExist (targetPath opts)
+      isDir <- doesDirectoryExist (targetPath opts)
 
-  if isFile
-    then searchFile opts (targetPath opts)
-    else
-      if isDir
-        then searchDirectory opts (targetPath opts)
-        else putStrLn $ "Error: " ++ targetPath opts ++ " is not a valid file or directory"
+      if tuiMode opts
+        then do
+          -- Collect all matches for TUI mode
+          matchesWithContext <-
+            if isFile
+              then collectMatchesFromFile opts (targetPath opts)
+              else
+                if isDir
+                  then collectMatchesFromDirectory opts (targetPath opts)
+                  else do
+                    putStrLn $ "Error: " ++ targetPath opts ++ " is not a valid file or directory"
+                    return []
+          action <- runSearchResultsTUI matchesWithContext
+          case action of
+            NewSearch -> runInteractiveSearchLoop opts
+            Quit -> return ()
+        else do
+          -- Stream output in CLI mode
+          if isFile
+            then searchFile opts (targetPath opts)
+            else
+              if isDir
+                then searchDirectory opts (targetPath opts)
+                else putStrLn $ "Error: " ++ targetPath opts ++ " is not a valid file or directory"
+
+-- | Loop between interactive search form and results
+runInteractiveSearchLoop :: Options -> IO ()
+runInteractiveSearchLoop opts = do
+  maybeParams <- runInteractiveTUI opts
+  case maybeParams of
+    Nothing -> return ()  -- User quit
+    Just params -> do
+      -- Run the search with the parameters
+      let searchOpts = Options
+            { searchPattern = Just (spPattern params),
+              searchTypes = spSearchTypes params,
+              targetPath = spPath params,
+              fileExtensions = spExtensions params,
+              tuiMode = True
+            }
+
+      isFile <- doesFileExist (spPath params)
+      isDir <- doesDirectoryExist (spPath params)
+
+      matchesWithContext <-
+        if isFile
+          then collectMatchesFromFile searchOpts (spPath params)
+          else
+            if isDir
+              then collectMatchesFromDirectory searchOpts (spPath params)
+              else do
+                putStrLn $ "Error: " ++ spPath params ++ " is not a valid file or directory"
+                return []
+
+      action <- runSearchResultsTUI matchesWithContext
+      case action of
+        NewSearch -> runInteractiveSearchLoop opts  -- Loop back to search form
+        Quit -> return ()
+
+collectMatchesFromDirectory :: Options -> FilePath -> IO [MatchWithContext]
+collectMatchesFromDirectory opts dir = do
+  entries <- listDirectory dir
+  gitignorePatterns <- readGitignore (dir FP.</> ".gitignore")
+
+  let filteredEntries = filter (not . shouldIgnore gitignorePatterns) entries
+      fullPaths = map (dir FP.</>) filteredEntries
+
+  files <- filterM doesFileExist fullPaths
+  dirs <- filterM doesDirectoryExist fullPaths
+
+  -- Process files strictly to avoid accumulating file handles
+  fileMatches <- fmap concat $ forM files $ \file -> do
+    matches <- collectMatchesFromFile opts file
+    evaluate (length matches)  -- Force evaluation before moving to next file
+    return matches
+
+  -- Process directories strictly
+  dirMatches <- fmap concat $ forM dirs $ \subdir -> do
+    matches <- collectMatchesFromDirectory opts subdir
+    evaluate (length matches)  -- Force evaluation before moving to next directory
+    return matches
+
+  let allMatches = fileMatches ++ dirMatches
+  evaluate (length allMatches)  -- Force evaluation of combined results
+  return allMatches
+
+collectMatchesFromFile :: Options -> FilePath -> IO [MatchWithContext]
+collectMatchesFromFile opts file = do
+  let ext = takeExtension file
+      shouldSearchFile = null (fileExtensions opts) || ext `elem` fileExtensions opts
+
+  case searchPattern opts of
+    Nothing -> return []
+    Just pattern -> do
+      if not shouldSearchFile
+        then return []
+        else case languageForExtension ext of
+          Nothing -> return []
+          Just lang -> do
+            content <- BS.readFile file
+            evaluate (BS.length content)  -- Force strict evaluation to close file handle
+            let fileLines = lines (BS8.unpack content)  -- Convert ByteString to lines instead of reading twice
+            case parseFile lang content of
+              Left _err -> return []
+              Right tree -> do
+                let matches = findMatches (searchTypes opts) pattern tree content
+                    results = map (createMatchWithContext file fileLines) matches
+                evaluate (length results)  -- Force evaluation of results
+                return results
+
+createMatchWithContext :: FilePath -> [String] -> Match -> MatchWithContext
+createMatchWithContext file fileLines match =
+  let lineNum = matchLine match
+      contextBefore = 2
+      contextAfter = 2
+      startLine = max 1 (lineNum - contextBefore)
+      endLine = min (length fileLines) (lineNum + contextAfter)
+      contextLines = zip [startLine .. endLine] (take (endLine - startLine + 1) $ drop (startLine - 1) fileLines)
+   in MatchWithContext match file contextLines
 
 searchDirectory :: Options -> FilePath -> IO ()
 searchDirectory opts dir = do
@@ -178,18 +300,21 @@ searchFile opts file = do
   let ext = takeExtension file
       shouldSearchFile = null (fileExtensions opts) || ext `elem` fileExtensions opts
 
-  when shouldSearchFile $ do
-    case languageForExtension ext of
-      Nothing -> return ()
-      Just lang -> do
-        content <- BS.readFile file
-        fileLines <- lines <$> readFile file
-        case parseFile lang content of
-          Left _err -> return ()
-          Right tree -> do
-            let matches = findMatches (searchTypes opts) (searchPattern opts) tree content
-            forM_ matches $ \match -> do
-              printMatchCard opts file fileLines match
+  case searchPattern opts of
+    Nothing -> return ()
+    Just pattern -> do
+      when shouldSearchFile $ do
+        case languageForExtension ext of
+          Nothing -> return ()
+          Just lang -> do
+            content <- BS.readFile file
+            let fileLines = lines (BS8.unpack content)  -- Convert ByteString to lines instead of reading twice
+            case parseFile lang content of
+              Left _err -> return ()
+              Right tree -> do
+                let matches = findMatches (searchTypes opts) pattern tree content
+                forM_ matches $ \match -> do
+                  printMatchCard opts file fileLines match
 
 printMatchCard :: Options -> FilePath -> [String] -> Match -> IO ()
 printMatchCard opts file fileLines match = do

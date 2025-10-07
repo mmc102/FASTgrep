@@ -16,8 +16,10 @@ common warnings
 executable fastgrep
     import:           warnings
     main-is:          Main.hs
+    other-modules:    TUI
     hs-source-dirs:   app
     default-language: GHC2021
+    ghc-options:      -threaded
     build-depends:    base >=4.16
                     , fastgrep
                     , bytestring
@@ -26,6 +28,14 @@ executable fastgrep
                     , filepath
                     , directory
                     , ansi-terminal
+                    , brick
+                    , vty
+                    , vty-crossplatform
+                    , microlens
+                    , microlens-th
+                    , microlens-mtl
+                    , vector
+                    , deepseq
 
 library
     import:           warnings
