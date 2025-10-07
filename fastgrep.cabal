@@ -1,0 +1,57 @@
+cabal-version:      3.0
+name:               fastgrep
+version:            0.1.0.0
+synopsis:           Freakin-AST grep: AST-aware grep
+description:        CLI tool to grep for specific syntactic elements like literals in codebases
+license:            BSD-3-Clause
+author:             hew carrot
+maintainer:         mcarroll1220@gmail.com
+category:           Development
+build-type:         Simple
+extra-doc-files:    README.md
+
+common warnings
+    ghc-options: -Wall
+
+executable fastgrep
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    default-language: GHC2021
+    build-depends:    base >=4.16
+                    , fastgrep
+                    , bytestring
+                    , text
+                    , optparse-applicative
+                    , filepath
+                    , directory
+                    , ansi-terminal
+
+library
+    import:           warnings
+    exposed-modules:  Parser
+                    , Matcher
+    hs-source-dirs:   src
+    default-language: GHC2021
+    build-depends:    base >=4.16
+                    , bytestring
+                    , tree-sitter
+                    , tree-sitter-python
+                    , tree-sitter-go
+                    , tree-sitter-haskell
+                    , tree-sitter-typescript
+                    , tree-sitter-tsx
+                    , tree-sitter-ruby
+
+test-suite fastgrep-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   test
+    default-language: GHC2021
+    build-depends:    base >=4.16
+                    , fastgrep
+                    , bytestring
+                    , tasty
+                    , tasty-hunit
+                    , filepath
