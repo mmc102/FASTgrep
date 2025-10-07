@@ -2,21 +2,24 @@
 
 ## Installation
 
-`todo`
+`cabal build`
+`cabal install --install-method=copy --overwrite-policy=always`
+confirm it works:
+`fastgrep`
+
+TODO: distribute a binary
 
 ## Why
 
-ACME Corp. [Accounts][Transactions][Settings]
-
 "I wonder where in the codebase this `Accounts` button is..."
 
-*CMD-F `Accounts`*
+`CMD-F Accounts`
 
 _298 results_
 
 "ok, ok"
 
-*CMD-F `Accounts`, .tsx, .js*
+`CMD-F Accounts files: .tsx, .js`
 
 _198 results_
 
