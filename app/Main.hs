@@ -131,9 +131,9 @@ runSearch opts = do
                   else do
                     putStrLn $ "Error: " ++ targetPath opts ++ " is not a valid file or directory"
                     return []
-          action <- runSearchResultsTUI matchesWithContext
+          (action, newParams) <- runSearchResultsTUI matchesWithContext pattern (targetPath opts) (fileExtensions opts) (searchTypes opts)
           case action of
-            NewSearch -> runInteractiveSearchLoop opts
+            NewSearch -> runSearchWithParams newParams
             Quit -> return ()
         else do
           -- Stream output in CLI mode
@@ -150,33 +150,36 @@ runInteractiveSearchLoop opts = do
   maybeParams <- runInteractiveTUI opts
   case maybeParams of
     Nothing -> return ()  -- User quit
-    Just params -> do
-      -- Run the search with the parameters
-      let searchOpts = Options
-            { searchPattern = Just (spPattern params),
-              searchTypes = spSearchTypes params,
-              targetPath = spPath params,
-              fileExtensions = spExtensions params,
-              tuiMode = True
-            }
+    Just params -> runSearchWithParams params
 
-      isFile <- doesFileExist (spPath params)
-      isDir <- doesDirectoryExist (spPath params)
+-- | Run search with given parameters
+runSearchWithParams :: SearchParams -> IO ()
+runSearchWithParams params = do
+  let searchOpts = Options
+        { searchPattern = Just (spPattern params),
+          searchTypes = spSearchTypes params,
+          targetPath = spPath params,
+          fileExtensions = spExtensions params,
+          tuiMode = True
+        }
 
-      matchesWithContext <-
-        if isFile
-          then collectMatchesFromFile searchOpts (spPath params)
-          else
-            if isDir
-              then collectMatchesFromDirectory searchOpts (spPath params)
-              else do
-                putStrLn $ "Error: " ++ spPath params ++ " is not a valid file or directory"
-                return []
+  isFile <- doesFileExist (spPath params)
+  isDir <- doesDirectoryExist (spPath params)
 
-      action <- runSearchResultsTUI matchesWithContext
-      case action of
-        NewSearch -> runInteractiveSearchLoop opts  -- Loop back to search form
-        Quit -> return ()
+  matchesWithContext <-
+    if isFile
+      then collectMatchesFromFile searchOpts (spPath params)
+      else
+        if isDir
+          then collectMatchesFromDirectory searchOpts (spPath params)
+          else do
+            putStrLn $ "Error: " ++ spPath params ++ " is not a valid file or directory"
+            return []
+
+  (action, newParams) <- runSearchResultsTUI matchesWithContext (spPattern params) (spPath params) (spExtensions params) (spSearchTypes params)
+  case action of
+    NewSearch -> runSearchWithParams newParams  -- Loop with updated params
+    Quit -> return ()
 
 collectMatchesFromDirectory :: Options -> FilePath -> IO [MatchWithContext]
 collectMatchesFromDirectory opts dir = do
