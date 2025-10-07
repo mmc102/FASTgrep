@@ -22,6 +22,8 @@ import Lens.Micro ((&), (^.), (.~), (%~))
 import Lens.Micro.Mtl (zoom)
 import Lens.Micro.TH (makeLenses)
 import Matcher
+import System.Environment (lookupEnv)
+import System.Process (callCommand)
 
 -- | A match with file context
 data MatchWithContext = MatchWithContext
@@ -226,7 +228,7 @@ drawHelp st =
   padLeftRight 1 $
     if st ^. searchFocused
       then str "Tab: next field | ESC: unfocus | Enter: search | l/i/f/d/x: toggle types"
-      else str "s/n: focus search | ↑/↓: navigate | l/i/f/d/x: toggle types | Enter: search | q: quit"
+      else str "s/n: focus search | ↑/↓: navigate | o: open in $EDITOR | l/i/f/d/x: toggle types | Enter: search | q: quit"
 
 -- | Get match type label
 getMatchTypeLabel :: SearchType -> String
@@ -284,6 +286,13 @@ handleBrowseModeEvent e =
     V.EvKey (V.KChar 's') [] -> modify $ \st -> st & searchFocused .~ True
     V.EvKey (V.KChar 'n') [] -> modify $ \st -> st & searchFocused .~ True
     V.EvKey V.KEnter [] -> modify (\s -> s & resultAction .~ Just NewSearch) >> halt
+    V.EvKey (V.KChar 'o') [] -> do
+      st <- get
+      case listSelectedElement (st ^. matchList) of
+        Nothing -> return ()
+        Just (_, mwc) -> suspendAndResume $ do
+          openInEditor mwc
+          return st
     -- Navigate results
     V.EvKey V.KDown [] -> modify $ \st -> st {_matchList = listMoveDown (_matchList st)}
     V.EvKey V.KUp [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
@@ -296,6 +305,21 @@ handleBrowseModeEvent e =
     V.EvKey (V.KChar 'd') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionDef
     V.EvKey (V.KChar 'x') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
     _ -> return ()
+
+-- | Open the selected match in $EDITOR
+openInEditor :: MatchWithContext -> IO ()
+openInEditor mwc = do
+  let match = _mwcMatch mwc
+      filepath = _mwcFilePath mwc
+      lineNum = matchLine match
+
+  maybeEditor <- lookupEnv "EDITOR"
+  case maybeEditor of
+    Nothing -> putStrLn "Error: $EDITOR not set. Cannot open file."
+    Just editor -> do
+      -- Most editors support +line syntax (vim, emacs, nano, etc.)
+      let command = editor ++ " +" ++ show lineNum ++ " " ++ show filepath
+      callCommand command
 
 toggleSearchType :: SearchType -> [SearchType] -> [SearchType]
 toggleSearchType t ts

@@ -36,6 +36,7 @@ executable fastgrep
                     , microlens-mtl
                     , vector
                     , deepseq
+                    , process
 
 library
     import:           warnings
