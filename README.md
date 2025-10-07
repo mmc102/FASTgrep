@@ -1,10 +1,16 @@
 # FASTgrep: Freakin' Abstract Syntax Tree Grep
+![Help Page](images/help.png)
+![Results](images/results.png)
+
 
 ## Installation
 
 `cabal build`
+
 `cabal install --install-method=copy --overwrite-policy=always`
+
 confirm it works:
+
 `fastgrep`
 
 TODO: distribute a binary
