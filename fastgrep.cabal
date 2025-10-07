@@ -37,6 +37,8 @@ executable fastgrep
                     , vector
                     , deepseq
                     , process
+                    , containers
+                    , tree-sitter
 
 library
     import:           warnings

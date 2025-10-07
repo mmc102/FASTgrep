@@ -4,12 +4,16 @@ module Main where
 
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
-import Control.Monad (filterM, forM, forM_, when)
+import Control.Concurrent (forkIO)
+import Control.Monad (filterM, foldM, forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
-import Data.List (isPrefixOf, isSuffixOf)
-import Data.Maybe (catMaybes)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, fromMaybe)
+import Foreign.Ptr (Ptr)
 import Matcher
 import Options.Applicative
 import Parser
@@ -20,7 +24,20 @@ import System.Exit (exitSuccess, exitWith)
 import System.FilePath (takeExtension, takeFileName)
 import System.FilePath qualified as FP
 import System.IO (hFlush, stdout)
-import TUI (MatchWithContext (..), ResultsAction (..), SearchParams (..), runInteractiveTUI, runSearchResultsTUI, spExtensions, spPath, spPattern, spSearchTypes)
+import TreeSitter.Tree (Tree)
+import TUI (AppEvent (..), MatchWithContext (..), ResultsAction (..), SearchParams (..), runInteractiveTUI, runSearchResultsTUI, runSearchResultsTUIWithAsync, spExtensions, spPath, spPattern, spSearchTypes)
+import Brick.BChan (BChan, newBChan, writeBChan)
+
+-- | Cached AST data for a file
+data CachedAST = CachedAST
+  { astTree :: Ptr Tree,
+    astContent :: BS.ByteString,
+    astLines :: [String],
+    astLang :: Lang
+  }
+
+-- | AST cache mapping file paths to their parsed trees
+type ASTCache = Map FilePath CachedAST
 
 data Options = Options
   { searchPattern :: Maybe String,
@@ -152,9 +169,17 @@ runInteractiveSearchLoop opts = do
     Nothing -> return ()  -- User quit
     Just params -> runSearchWithParams params
 
--- | Run search with given parameters
+-- | Run search with given parameters - builds cache on first run
 runSearchWithParams :: SearchParams -> IO ()
-runSearchWithParams params = do
+runSearchWithParams params = runSearchWithCache params Nothing
+
+-- | Run search with optional cache (builds cache if not provided)
+runSearchWithCache :: SearchParams -> Maybe ASTCache -> IO ()
+runSearchWithCache params maybeCache = runSearchWithCacheAndResults params maybeCache []
+
+-- | Run search with cache and previous results
+runSearchWithCacheAndResults :: SearchParams -> Maybe ASTCache -> [MatchWithContext] -> IO ()
+runSearchWithCacheAndResults params maybeCache previousResults = do
   let searchOpts = Options
         { searchPattern = Just (spPattern params),
           searchTypes = spSearchTypes params,
@@ -163,23 +188,228 @@ runSearchWithParams params = do
           tuiMode = True
         }
 
-  isFile <- doesFileExist (spPath params)
-  isDir <- doesDirectoryExist (spPath params)
+  -- Build cache synchronously if needed (only on first search or path change)
+  cache <- case maybeCache of
+    Just c -> return c
+    Nothing -> do
+      -- Build cache synchronously before launching TUI
+      -- We show loading in the TUI itself for searches
+      isFile <- doesFileExist (spPath params)
+      isDir <- doesDirectoryExist (spPath params)
 
-  matchesWithContext <-
-    if isFile
-      then collectMatchesFromFile searchOpts (spPath params)
-      else
-        if isDir
-          then collectMatchesFromDirectory searchOpts (spPath params)
-          else do
-            putStrLn $ "Error: " ++ spPath params ++ " is not a valid file or directory"
-            return []
+      if isFile
+        then do
+          cached <- cacheFile searchOpts (spPath params)
+          return $ maybe Map.empty (\c -> Map.singleton (spPath params) c) cached
+        else if isDir
+          then cacheDirectory searchOpts (spPath params)
+          else return Map.empty
 
-  (action, newParams) <- runSearchResultsTUI matchesWithContext (spPattern params) (spPath params) (spExtensions params) (spSearchTypes params)
+  -- Create async search action that uses the cache
+  let searchAction chan = do
+        -- Perform search on cached ASTs (runs in background thread)
+        let matchesWithContext = searchCachedASTs cache (spPattern params) (spSearchTypes params)
+
+        -- Send results
+        writeBChan chan (SearchComplete matchesWithContext)
+
+  -- Run TUI with async search
+  (action, newParams) <- runSearchResultsTUIWithAsync
+    previousResults
+    (spPattern params)
+    (spPath params)
+    (spExtensions params)
+    (spSearchTypes params)
+    searchAction
+
   case action of
-    NewSearch -> runSearchWithParams newParams  -- Loop with updated params
+    NewSearch -> do
+      -- Check if we need to rebuild cache
+      if spPath newParams /= spPath params || spExtensions newParams /= spExtensions params
+        then runSearchWithCacheAndResults newParams Nothing []
+        else runSearchWithCacheAndResults newParams (Just cache) []  -- Pass the cache!
     Quit -> return ()
+
+-- | Build AST cache with progress updates sent via BChan
+buildASTCacheWithProgress :: Options -> FilePath -> BChan AppEvent -> IO ASTCache
+buildASTCacheWithProgress opts path chan = do
+  isFile <- doesFileExist path
+  isDir <- doesDirectoryExist path
+
+  if isFile
+    then do
+      cache <- cacheFileWithProgress opts path chan 1 1
+      return $ maybe Map.empty (\c -> Map.singleton path c) cache
+    else if isDir
+      then cacheDirectoryWithProgress opts path chan
+      else return Map.empty
+
+-- | Count total files to parse
+countFiles :: Options -> FilePath -> IO Int
+countFiles opts path = do
+  isFile <- doesFileExist path
+  isDir <- doesDirectoryExist path
+
+  if isFile
+    then return 1
+    else if isDir
+      then countFilesInDirectory opts path
+      else return 0
+
+-- | Count files in directory
+countFilesInDirectory :: Options -> FilePath -> IO Int
+countFilesInDirectory opts dir = do
+  entries <- listDirectory dir
+  gitignorePatterns <- readGitignore (dir FP.</> ".gitignore")
+
+  let filteredEntries = filter (not . shouldIgnore gitignorePatterns) entries
+      fullPaths = map (dir FP.</>) filteredEntries
+
+  files <- filterM doesFileExist fullPaths
+  dirs <- filterM doesDirectoryExist fullPaths
+
+  let matchingFiles = filter (\f -> let ext = takeExtension f
+                                     in null (fileExtensions opts) || ext `elem` fileExtensions opts) files
+
+  dirCounts <- mapM (countFilesInDirectory opts) dirs
+  return $ length matchingFiles + sum dirCounts
+
+-- | Cache directory with progress updates
+cacheDirectoryWithProgress :: Options -> FilePath -> BChan AppEvent -> IO ASTCache
+cacheDirectoryWithProgress opts dir chan = do
+  -- Count total files first
+  totalFiles <- countFilesInDirectory opts dir
+
+  -- Cache with progress tracking
+  cacheDirectoryWithProgressHelper opts dir chan 0 totalFiles
+
+-- | Helper for caching directory with progress
+cacheDirectoryWithProgressHelper :: Options -> FilePath -> BChan AppEvent -> Int -> Int -> IO ASTCache
+cacheDirectoryWithProgressHelper opts dir chan currentCount totalFiles = do
+  entries <- listDirectory dir
+  gitignorePatterns <- readGitignore (dir FP.</> ".gitignore")
+
+  let filteredEntries = filter (not . shouldIgnore gitignorePatterns) entries
+      fullPaths = map (dir FP.</>) filteredEntries
+
+  files <- filterM doesFileExist fullPaths
+  dirs <- filterM doesDirectoryExist fullPaths
+
+  -- Cache files with progress
+  (fileCaches, newCount) <- foldM (\(caches, count) file -> do
+      maybeCache <- cacheFileWithProgress opts file chan count totalFiles
+      return (case maybeCache of
+                Just cache -> Map.singleton file cache : caches
+                Nothing -> caches,
+              count + 1)
+    ) ([], currentCount) files
+
+  -- Cache subdirectories
+  (dirCaches, _) <- foldM (\(caches, count) subdir -> do
+      cache <- cacheDirectoryWithProgressHelper opts subdir chan count totalFiles
+      return (cache : caches, count + Map.size cache)
+    ) ([], newCount) dirs
+
+  return $ Map.unions (fileCaches ++ dirCaches)
+
+-- | Cache a single file with progress update
+cacheFileWithProgress :: Options -> FilePath -> BChan AppEvent -> Int -> Int -> IO (Maybe CachedAST)
+cacheFileWithProgress opts file chan currentCount totalFiles = do
+  let ext = takeExtension file
+      shouldCache = null (fileExtensions opts) || ext `elem` fileExtensions opts
+
+  if not shouldCache
+    then return Nothing
+    else case languageForExtension ext of
+      Nothing -> return Nothing
+      Just lang -> do
+        content <- BS.readFile file
+        evaluate (BS.length content)
+        let fileLines = lines (BS8.unpack content)
+        case parseFile lang content of
+          Left _err -> return Nothing
+          Right tree -> do
+            -- Send progress update
+            writeBChan chan (UpdateProgress currentCount totalFiles)
+            return $ Just CachedAST
+              { astTree = tree,
+                astContent = content,
+                astLines = fileLines,
+                astLang = lang
+              }
+
+-- | Build AST cache for all files in the given path
+buildASTCache :: Options -> FilePath -> IO ASTCache
+buildASTCache opts path = do
+  isFile <- doesFileExist path
+  isDir <- doesDirectoryExist path
+
+  if isFile
+    then do
+      cache <- cacheFile opts path
+      return $ maybe Map.empty (\c -> Map.singleton path c) cache
+    else if isDir
+      then cacheDirectory opts path
+      else do
+        putStrLn $ "Error: " ++ path ++ " is not a valid file or directory"
+        return Map.empty
+
+-- | Cache ASTs for all files in a directory
+cacheDirectory :: Options -> FilePath -> IO ASTCache
+cacheDirectory opts dir = do
+  entries <- listDirectory dir
+  gitignorePatterns <- readGitignore (dir FP.</> ".gitignore")
+
+  let filteredEntries = filter (not . shouldIgnore gitignorePatterns) entries
+      fullPaths = map (dir FP.</>) filteredEntries
+
+  files <- filterM doesFileExist fullPaths
+  dirs <- filterM doesDirectoryExist fullPaths
+
+  -- Cache files
+  fileCaches <- forM files $ \file -> do
+    maybeCache <- cacheFile opts file
+    return $ case maybeCache of
+      Just cache -> Map.singleton file cache
+      Nothing -> Map.empty
+
+  -- Cache directories
+  dirCaches <- forM dirs $ \subdir -> cacheDirectory opts subdir
+
+  return $ Map.unions (fileCaches ++ dirCaches)
+
+-- | Cache a single file's AST
+cacheFile :: Options -> FilePath -> IO (Maybe CachedAST)
+cacheFile opts file = do
+  let ext = takeExtension file
+      shouldCache = null (fileExtensions opts) || ext `elem` fileExtensions opts
+
+  if not shouldCache
+    then return Nothing
+    else case languageForExtension ext of
+      Nothing -> return Nothing
+      Just lang -> do
+        content <- BS.readFile file
+        evaluate (BS.length content)
+        let fileLines = lines (BS8.unpack content)
+        case parseFile lang content of
+          Left _err -> return Nothing
+          Right tree -> do
+            return $ Just CachedAST
+              { astTree = tree,
+                astContent = content,
+                astLines = fileLines,
+                astLang = lang
+              }
+
+-- | Search using cached ASTs
+searchCachedASTs :: ASTCache -> String -> [SearchType] -> [MatchWithContext]
+searchCachedASTs cache pattern types =
+  concat $ map searchCachedFile $ Map.toList cache
+  where
+    searchCachedFile (filepath, cached) =
+      let matches = findMatches types pattern (astTree cached) (astContent cached)
+       in map (createMatchWithContext filepath (astLines cached)) matches
 
 collectMatchesFromDirectory :: Options -> FilePath -> IO [MatchWithContext]
 collectMatchesFromDirectory opts dir = do
@@ -269,7 +499,16 @@ defaultIgnorePatterns =
     "target",
     "build",
     ".idea",
-    ".vscode"
+    ".vscode",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    "__pycache__",
+    ".pytest_cache",
+    "venv",
+    ".venv",
+    "env",
+    ".env"
   ]
 
 readGitignore :: FilePath -> IO [String]
@@ -290,12 +529,17 @@ readGitignore path = do
 shouldIgnore :: [String] -> FilePath -> Bool
 shouldIgnore patterns path =
   let name = takeFileName path
-   in any (`matchPattern` name) patterns
+   in any (\p -> matchPattern p name path) patterns
 
-matchPattern :: String -> String -> Bool
-matchPattern pattern name
-  | "/" `isSuffixOf` pattern = pattern `isPrefixOf` (name ++ "/")
+matchPattern :: String -> String -> FilePath -> Bool
+matchPattern pattern name fullPath
+  -- Match directory patterns like "frontend/.next"
+  | '/' `elem` pattern = pattern `isInfixOf` fullPath || pattern `isSuffixOf` fullPath
+  -- Match trailing slash patterns like "node_modules/"
+  | "/" `isSuffixOf` pattern = (init pattern) == name
+  -- Match glob patterns like "*.log"
   | "*" `isPrefixOf` pattern = drop 1 pattern `isSuffixOf` name
+  -- Exact match
   | otherwise = pattern == name
 
 searchFile :: Options -> FilePath -> IO ()
