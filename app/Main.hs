@@ -3,6 +3,7 @@
 module Main where
 
 import Control.Monad (filterM, forM_, when)
+import Control.Monad.IO.Class (liftIO)
 import Data.ByteString qualified as BS
 import Data.List (isPrefixOf, isSuffixOf)
 import Data.Maybe (catMaybes)
@@ -11,6 +12,8 @@ import Options.Applicative
 import Parser
 import System.Console.ANSI
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
+import System.Environment (getArgs, getProgName)
+import System.Exit (exitSuccess, exitWith)
 import System.FilePath (takeExtension, takeFileName)
 import System.FilePath qualified as FP
 import System.IO (hFlush, stdout)
@@ -44,17 +47,37 @@ optionsParser =
 
 main :: IO ()
 main = do
-  printBanner
-  opts <-
-    execParser $
-      info
-        (optionsParser <**> helper)
-        ( fullDesc
-            <> progDesc "Search for specific AST node types in source code (searches all types by default)"
-            <> header "fastgrep - AST-aware grep for code"
-        )
+  let parserInfo =
+        info
+          (optionsParser <**> helper)
+          ( fullDesc
+              <> progDesc "Search for specific AST node types in source code"
+              <> header "fastgrep - AST-aware grep for code"
+          )
 
+  opts <- execParserWithBannerOnHelp parserInfo
   runSearch opts
+
+execParserWithBannerOnHelp :: ParserInfo a -> IO a
+execParserWithBannerOnHelp pinfo = do
+  args <- getArgs
+  let result = execParserPure defaultPrefs pinfo args
+  handleParseResult' args result
+  where
+    handleParseResult' :: [String] -> ParserResult a -> IO a
+    handleParseResult' _ (Success a) = pure a
+    handleParseResult' args (Failure failure) = do
+      progn <- getProgName
+      let (msg, exitCode) = renderFailure failure progn
+      when ("--help" `elem` args || "-h" `elem` args) printBanner
+      putStr msg
+      exitWith exitCode
+    handleParseResult' _ (CompletionInvoked compl) = do
+      progn <- getProgName
+      msg <- execCompletion compl progn
+      printBanner
+      putStr msg
+      exitSuccess
 
 printBanner :: IO ()
 printBanner = do

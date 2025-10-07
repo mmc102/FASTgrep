@@ -59,4 +59,4 @@ And these flags:
 
 If there is a .gitignore, it will be respected with the search
 
-## disclaimer: it probably isn't acutally that fast.
+## disclaimer: it probably isn't acutally that fast
