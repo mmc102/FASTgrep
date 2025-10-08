@@ -39,6 +39,7 @@ executable fastgrep
                     , process
                     , containers
                     , tree-sitter
+                    , regex-tdfa
 
 library
     import:           warnings
@@ -55,6 +56,7 @@ library
                     , tree-sitter-typescript
                     , tree-sitter-tsx
                     , tree-sitter-ruby
+                    , regex-tdfa
 
 test-suite fastgrep-test
     import:           warnings

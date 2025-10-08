@@ -15,6 +15,8 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void, when)
 import Data.Char (toLower)
 import Data.Maybe (fromMaybe)
+import Text.Regex.TDFA ((=~), getAllTextMatches, makeRegex, matchOnce)
+import Text.Regex.TDFA.String ()
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector (Vector)
@@ -217,11 +219,11 @@ drawSearchControls st =
             ],
           hBox
             [ str "  Types: ",
-              str $ "[" ++ (if Literal `elem` st ^. searchTypes'' then "X" else " ") ++ "] (l) Literal  ",
-              str $ "[" ++ (if Identifier `elem` st ^. searchTypes'' then "X" else " ") ++ "] (i) Identifier  ",
-              str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "X" else " ") ++ "] (f) Function Call  ",
-              str $ "[" ++ (if FunctionDef `elem` st ^. searchTypes'' then "X" else " ") ++ "] (d) Definition  ",
-              str $ "[" ++ (if JsxText `elem` st ^. searchTypes'' then "X" else " ") ++ "] (x) JSX"
+              str $ "[" ++ (if Literal `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (l) Literal  ",
+              str $ "[" ++ (if Identifier `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (i) Identifier  ",
+              str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (c) Call  ",
+              str $ "[" ++ (if FunctionDef `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (d) Definition  ",
+              str $ "[" ++ (if JsxText `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (t) Inner Text"
             ]
         ]
     else
@@ -230,12 +232,12 @@ drawSearchControls st =
         [
           str $ T.unpack (T.strip (T.unlines (E.getEditContents (st ^. patternEdit)))),
           str "  | ",
-          str $ "[" ++ (if Literal `elem` st ^. searchTypes'' then "X" else " ") ++ "] (l) Literal  ",
-          str $ "[" ++ (if Identifier `elem` st ^. searchTypes'' then "X" else " ") ++ "] (i) Identifier  ",
-          str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "X" else " ") ++ "] (f) Function Call  ",
-          str $ "[" ++ (if FunctionDef `elem` st ^. searchTypes'' then "X" else " ") ++ "] (d) Definition  ",
-          str $ "[" ++ (if JsxText `elem` st ^. searchTypes'' then "X" else " ") ++ "] (x) JSX",
-          str "  (press 's' to edit)"
+          str $ "[" ++ (if Literal `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (l) Literal  ",
+          str $ "[" ++ (if Identifier `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (i) Identifier  ",
+          str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (c) Call  ",
+          str $ "[" ++ (if FunctionDef `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (d) Definition  ",
+          str $ "[" ++ (if JsxText `elem` st ^. searchTypes'' then "✓" else " ") ++ "] (t) Inner Text",
+          str "  (press 'f' to edit)"
         ]
 
 drawMatchList :: AppState -> Widget Name
@@ -305,20 +307,23 @@ drawContextLine matchLineNum match searchPattern (lineNum, lineText) =
       lineWidget =
         if isMatchLine
           then
-            -- Highlight the search pattern within the line
-            case findSubstring searchPattern lineText of
-              Just idx ->
-                let before = take idx lineText
-                    highlighted = take (length searchPattern) (drop idx lineText)
-                    after = drop (idx + length searchPattern) lineText
-                 in hBox
+            if null searchPattern
+              then
+                -- Empty pattern - just show the line normally
+                withAttr (getMatchTypeAttr (matchType match)) $ str lineText
+              else
+                -- Highlight the search pattern within the line using regex
+                case lineText =~ searchPattern :: (String, String, String) of
+                  (before, "", _) ->
+                    -- No match - fallback to highlighting the whole matched node
+                    withAttr (getMatchTypeAttr (matchType match)) $ str lineText
+                  (before, matched, after) ->
+                    -- Highlight the matched portion
+                    hBox
                       [ withAttr (attrName "context") $ str before,
-                        withAttr (getMatchTypeAttr (matchType match)) $ str highlighted,
+                        withAttr (getMatchTypeAttr (matchType match)) $ str matched,
                         withAttr (attrName "context") $ str after
                       ]
-              Nothing ->
-                -- Fallback: highlight the whole matched node
-                withAttr (getMatchTypeAttr (matchType match)) $ str lineText
           else withAttr (attrName "context") $ str lineText
    in hBox
         [ if isMatchLine
@@ -328,29 +333,26 @@ drawContextLine matchLineNum match searchPattern (lineNum, lineText) =
           lineWidget
         ]
 
--- | Find the index of a substring within a string (case-insensitive search)
+-- | Find the index of a regex match within a string
 findSubstring :: String -> String -> Maybe Int
-findSubstring needle haystack = go 0 haystack
-  where
-    needleLower = map toLower needle
-    go _ [] = Nothing
-    go idx str@(_:rest)
-      | take (length needle) (map toLower str) == needleLower = Just idx
-      | otherwise = go (idx + 1) rest
+findSubstring pattern haystack =
+  case haystack =~ pattern :: (String, String, String) of
+    (before, "", _) -> Nothing  -- No match
+    (before, _, _) -> Just (length before)  -- Return start index
 
 drawHelp :: AppState -> Widget Name
 drawHelp appState =
   padLeftRight 1 $
     if appState ^. searchFocused
-      then str "Tab: next field | ESC: unfocus | Enter: search | l/i/f/d/x: toggle types"
-      else str "s/n: focus search | ↑,j/↓,k: navigate | y: copy | o: open in $EDITOR | l/i/f/d/x: toggle types | Enter: search | q: quit"
+      then str "Tab: next field | ESC: unfocus | Enter: search | l/i/c/d/t: toggle types"
+      else str "f/s/n: focus search | ↑,j/↓,k: navigate | y: copy | o: open in $EDITOR | l/i/c/d/t: toggle types | Enter: search | q: quit"
 
 getMatchTypeLabel :: SearchType -> String
 getMatchTypeLabel Literal = "[LIT]"
 getMatchTypeLabel Identifier = "[ID]"
 getMatchTypeLabel FunctionCall = "[CALL]"
 getMatchTypeLabel FunctionDef = "[DEF]"
-getMatchTypeLabel JsxText = "[JSX]"
+getMatchTypeLabel JsxText = "[TEXT]"
 
 -- | Get match type attribute
 getMatchTypeAttr :: SearchType -> AttrName
@@ -403,9 +405,9 @@ handleSearchModeEvent e =
     -- Toggle types still works while editing
     V.EvKey (V.KChar 'l') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Literal
     V.EvKey (V.KChar 'i') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Identifier
-    V.EvKey (V.KChar 'f') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
+    V.EvKey (V.KChar 'c') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
     V.EvKey (V.KChar 'd') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionDef
-    V.EvKey (V.KChar 'x') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
+    V.EvKey (V.KChar 't') [V.MCtrl] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
     _ -> do
       st <- get
       case F.focusGetCurrent (st ^. focusRing) of
@@ -420,6 +422,7 @@ handleBrowseModeEvent e =
   case e of
     V.EvKey (V.KChar 'q') [] -> modify (\s -> s & resultAction .~ Just Quit) >> halt
     V.EvKey V.KEsc [] -> modify (\s -> s & resultAction .~ Just Quit) >> halt
+    V.EvKey (V.KChar 'f') [] -> modify $ \st -> st & searchFocused .~ True
     V.EvKey (V.KChar 's') [] -> modify $ \st -> st & searchFocused .~ True
     V.EvKey (V.KChar 'n') [] -> modify $ \st -> st & searchFocused .~ True
     V.EvKey V.KEnter [] -> do
@@ -458,9 +461,9 @@ handleBrowseModeEvent e =
     V.EvKey (V.KChar 'k') [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
     V.EvKey (V.KChar 'l') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Literal
     V.EvKey (V.KChar 'i') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Identifier
-    V.EvKey (V.KChar 'f') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
+    V.EvKey (V.KChar 'c') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
     V.EvKey (V.KChar 'd') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionDef
-    V.EvKey (V.KChar 'x') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
+    V.EvKey (V.KChar 't') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
     _ -> return ()
 
 copyToClipboard :: MatchWithContext -> IO ()

@@ -11,13 +11,15 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.List (isInfixOf)
+import Data.Word (Word32)
 import Foreign.C.String (peekCString)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek, poke)
 import System.IO.Unsafe (unsafePerformIO)
+import Text.Regex.TDFA ((=~))
 import TreeSitter.Cursor
-import TreeSitter.Node (Node, nodeEndByte, nodeStartByte, nodeStartPoint, nodeTSNode, nodeType, pointColumn, pointRow)
+import TreeSitter.Node (Node, TSNode, nodeChildCount, nodeEndByte, nodeStartByte, nodeStartPoint, nodeTSNode, nodeType, pointColumn, pointRow)
 import TreeSitter.Tree
 
 data SearchType
@@ -78,9 +80,10 @@ traverseWithCursor searchTypes pattern cursor sourceCode = do
       _ <- ts_tree_cursor_goto_parent cursor
 
       -- Only include current node's matches if no children matched
-      let currentMatches = if null siblingMatches
-                             then concatMap checkType typesToCheck
-                             else []
+      let currentMatches =
+            if null siblingMatches
+              then concatMap checkType typesToCheck
+              else []
       return (currentMatches ++ siblingMatches)
     else do
       -- Leaf node - check for matches
@@ -101,15 +104,77 @@ matchesType target nodeTypeStr =
   target `isInfixOf` nodeTypeStr
 
 checkNodeContent :: String -> Node -> ByteString -> SearchType -> [Match]
-checkNodeContent pattern node sourceCode searchType =
-  let startPoint = nodeStartPoint node
-      startByte = fromIntegral (nodeStartByte node)
-      endByte = fromIntegral (nodeEndByte node)
-      startLine = fromIntegral (pointRow startPoint) + 1
-      startCol = fromIntegral (pointColumn startPoint) + 1
-      nodeText = BS.take (endByte - startByte) $ BS.drop startByte sourceCode
-      nodeTextStr = BS8.unpack nodeText
-   in ( [ Match startLine startCol nodeTextStr searchType
-          | pattern `isInfixOf` nodeTextStr
-        ]
-      )
+checkNodeContent pattern node sourceCode searchType
+  | null pattern = []  -- Empty pattern matches nothing
+  | otherwise =
+      let startPoint = nodeStartPoint node
+          startByte = fromIntegral (nodeStartByte node)
+          endByte = fromIntegral (nodeEndByte node)
+          startLine = fromIntegral (pointRow startPoint) + 1
+          startCol = fromIntegral (pointColumn startPoint) + 1
+          nodeText = BS.take (endByte - startByte) $ BS.drop startByte sourceCode
+          nodeTextStr = BS8.unpack nodeText
+       in case searchType of
+            -- For function defs and calls, only check the name portion
+            FunctionDef -> checkFunctionName pattern node sourceCode searchType
+            FunctionCall -> checkFunctionName pattern node sourceCode searchType
+            -- For other types, check the entire node
+            _ ->
+              let matches = nodeTextStr =~ pattern :: Bool
+               in [ Match startLine startCol nodeTextStr searchType | matches ]
+
+-- | For functions, only check if the function name matches (not the entire body/args)
+checkFunctionName :: String -> Node -> ByteString -> SearchType -> [Match]
+checkFunctionName pattern node sourceCode searchType = unsafePerformIO $ do
+  let tsNode = nodeTSNode node
+      childCount = nodeChildCount node
+
+  -- Find the name child node (usually the first or second child)
+  -- For function_definition: child 0 is often 'def', child 1 is the name
+  -- For call_expression: child 0 is the function name
+  nameNode <- findNameNode tsNode childCount
+
+  case nameNode of
+    Nothing -> return []  -- No name node found, don't match
+    Just name -> do
+      let startPoint = nodeStartPoint name
+          startByte = fromIntegral (nodeStartByte name)
+          endByte = fromIntegral (nodeEndByte name)
+          startLine = fromIntegral (pointRow startPoint) + 1
+          startCol = fromIntegral (pointColumn startPoint) + 1
+          nameText = BS.take (endByte - startByte) $ BS.drop startByte sourceCode
+          nameTextStr = BS8.unpack nameText
+          matches = nameTextStr =~ pattern :: Bool
+          -- Use the full node text for display
+          fullStartByte = fromIntegral (nodeStartByte node)
+          fullEndByte = fromIntegral (nodeEndByte node)
+          fullNodeText = BS.take (fullEndByte - fullStartByte) $ BS.drop fullStartByte sourceCode
+          fullNodeTextStr = BS8.unpack fullNodeText
+      return [ Match startLine startCol fullNodeTextStr searchType | matches ]
+
+-- | Find the name node within a function def or call using cursor
+findNameNode :: TSNode -> Word32 -> IO (Maybe Node)
+findNameNode tsNode childCount
+  | childCount == 0 = return Nothing
+  | otherwise = alloca $ \tsNodePtr -> do
+      poke tsNodePtr tsNode
+      withCursor tsNodePtr $ \cursor -> do
+        hasChild <- ts_tree_cursor_goto_first_child cursor
+        if hasChild
+          then findNameInSiblings cursor
+          else return Nothing
+  where
+    findNameInSiblings :: Ptr Cursor -> IO (Maybe Node)
+    findNameInSiblings cursor = do
+      currentNode <- alloca $ \(ptr :: Ptr Node) -> do
+        _ <- ts_tree_cursor_current_node_p cursor ptr
+        peek ptr
+      nodeTypeStr <- peekCString (nodeType currentNode)
+      -- Look for identifier or name nodes
+      if nodeTypeStr `elem` ["identifier", "name", "property_identifier"]
+        then return (Just currentNode)
+        else do
+          hasNextSibling <- ts_tree_cursor_goto_next_sibling cursor
+          if hasNextSibling
+            then findNameInSiblings cursor
+            else return Nothing
