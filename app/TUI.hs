@@ -25,7 +25,7 @@ import Lens.Micro.Mtl (zoom)
 import Lens.Micro.TH (makeLenses)
 import Matcher
 import System.Environment (lookupEnv)
-import System.Process (callCommand)
+import System.Process (callCommand, readProcess)
 
 -- | A match with file context
 data MatchWithContext = MatchWithContext
@@ -67,7 +67,8 @@ data Name
 -- | Loading state
 data LoadingState
   = NotLoading
-  | Loading Int Int  -- files parsed, total files
+  | LoadingCache Int Int  -- Building AST cache: files parsed, total files
+  | SearchingCache  -- Searching through cached ASTs
   deriving (Eq)
 
 -- | Application state - unified search and results
@@ -101,15 +102,16 @@ initialState matches pattern path exts types =
       _resultAction = Nothing,
       _statusMessage = Nothing,
       _loadingState = NotLoading,
-      _lastSearchParams = Just (pattern, path, exts, types)  -- Store initial search params
+      _lastSearchParams = Just (pattern, path, exts, types)
     }
 
--- | Draw the UI - unified search and results
 drawUI :: AppState -> [Widget Name]
 drawUI st =
   case st ^. loadingState of
-    Loading parsed total ->
-      [drawLoadingOverlay parsed total, mainUI st]
+    LoadingCache parsed total ->
+      [drawCacheBuildingOverlay parsed total, mainUI st]
+    SearchingCache ->
+      [drawSearchingOverlay, mainUI st]
     NotLoading ->
       [mainUI st]
 
@@ -132,8 +134,24 @@ mainUI st = vBox
     drawHelp st
   ]
 
-drawLoadingOverlay :: Int -> Int -> Widget Name
-drawLoadingOverlay parsed total =
+drawCacheBuildingOverlay :: Int -> Int -> Widget Name
+drawCacheBuildingOverlay parsed total =
+  centerLayer $
+    withBorderStyle unicodeBold $
+      border $
+        padAll 2 $
+          vBox
+            [ withAttr (attrName "header") $ str "🔨 Building AST Cache",
+              str " ",
+              str $ "Parsing files: " ++ show parsed ++ " / " ++ show total,
+              str " ",
+              drawProgressBar parsed total,
+              str " ",
+              str "This happens once per codebase."
+            ]
+
+drawSearchingOverlay :: Widget Name
+drawSearchingOverlay =
   centerLayer $
     withBorderStyle unicodeBold $
       border $
@@ -200,7 +218,7 @@ drawSearchControls st =
             [ str "  Types: ",
               str $ "[" ++ (if Literal `elem` st ^. searchTypes'' then "X" else " ") ++ "] (l) Literal  ",
               str $ "[" ++ (if Identifier `elem` st ^. searchTypes'' then "X" else " ") ++ "] (i) Identifier  ",
-              str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "X" else " ") ++ "] (f) Function  ",
+              str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "X" else " ") ++ "] (f) Function Call  ",
               str $ "[" ++ (if FunctionDef `elem` st ^. searchTypes'' then "X" else " ") ++ "] (d) Definition  ",
               str $ "[" ++ (if JsxText `elem` st ^. searchTypes'' then "X" else " ") ++ "] (x) JSX"
             ]
@@ -208,12 +226,12 @@ drawSearchControls st =
     else
       -- Collapsed view when browsing results (just show pattern on one line)
       hBox
-        [ str "Pattern: ",
+        [
           str $ T.unpack (T.strip (T.unlines (E.getEditContents (st ^. patternEdit)))),
-          str "  |  Types: ",
+          str "  | ",
           str $ "[" ++ (if Literal `elem` st ^. searchTypes'' then "X" else " ") ++ "] (l) Literal  ",
           str $ "[" ++ (if Identifier `elem` st ^. searchTypes'' then "X" else " ") ++ "] (i) Identifier  ",
-          str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "X" else " ") ++ "] (f) Function  ",
+          str $ "[" ++ (if FunctionCall `elem` st ^. searchTypes'' then "X" else " ") ++ "] (f) Function Call  ",
           str $ "[" ++ (if FunctionDef `elem` st ^. searchTypes'' then "X" else " ") ++ "] (d) Definition  ",
           str $ "[" ++ (if JsxText `elem` st ^. searchTypes'' then "X" else " ") ++ "] (x) JSX",
           str "  (press 's' to edit)"
@@ -254,13 +272,14 @@ drawMatchDetail st =
     Just (_, mwc) ->
       let match = _mwcMatch mwc
           filepath = _mwcFilePath mwc
+          typeLabel = getMatchTypeLabel (matchType match)
           contextLines = _mwcContextLines mwc
           matchLineNum = matchLine match
        in vBox
             [ padLeftRight 1 $
                 withAttr (attrName "detail-header") $
                   str $
-                    "Match: " ++ matchText match,
+                    typeLabel,
               padLeftRight 1 $
                 str $
                   "Location: " ++ filepath ++ ":" ++ show matchLineNum ++ ":" ++ show (matchColumn match),
@@ -287,13 +306,12 @@ drawContextLine matchLineNum match (lineNum, lineText) =
         ]
 
 drawHelp :: AppState -> Widget Name
-drawHelp st =
+drawHelp appState =
   padLeftRight 1 $
-    if st ^. searchFocused
+    if appState ^. searchFocused
       then str "Tab: next field | ESC: unfocus | Enter: search | l/i/f/d/x: toggle types"
-      else str "s/n: focus search | ↑,j/↓,k: navigate | o: open in $EDITOR | l/i/f/d/x: toggle types | Enter: search | q: quit"
+      else str "s/n: focus search | ↑,j/↓,k: navigate | y: copy | o: open in $EDITOR | l/i/f/d/x: toggle types | Enter: search | q: quit"
 
--- | Get match type label
 getMatchTypeLabel :: SearchType -> String
 getMatchTypeLabel Literal = "[LIT]"
 getMatchTypeLabel Identifier = "[ID]"
@@ -322,8 +340,8 @@ handleEvent (AppEvent (SearchComplete matches)) = do
     & matchList .~ list MatchListName (Vec.fromList matches) 1
     & loadingState .~ NotLoading
 handleEvent (AppEvent (UpdateProgress parsed total)) = do
-  -- Update progress bar
-  modify $ \st -> st & loadingState .~ Loading parsed total
+  -- Update progress bar for cache building
+  modify $ \st -> st & loadingState .~ LoadingCache parsed total
 handleEvent _ = return ()
 
 -- | Handle events when search is focused
@@ -383,7 +401,7 @@ handleBrowseModeEvent e =
             Just lastParams -> currentParams /= lastParams
       when hasChanged $ do
         modify $ \s -> s
-          & loadingState .~ Loading 0 1
+          & loadingState .~ SearchingCache
           & resultAction .~ Just NewSearch
           & lastSearchParams .~ Just currentParams
         halt
@@ -394,12 +412,17 @@ handleBrowseModeEvent e =
         Just (_, mwc) -> suspendAndResume $ do
           openInEditor mwc
           return st
-    -- Navigate results
+    V.EvKey (V.KChar 'y') [] -> do
+      st <- get
+      case listSelectedElement (st ^. matchList) of
+        Nothing -> return ()
+        Just (_, mwc) -> suspendAndResume $ do
+          copyToClipboard mwc
+          return st
     V.EvKey V.KDown [] -> modify $ \st -> st {_matchList = listMoveDown (_matchList st)}
     V.EvKey V.KUp [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
     V.EvKey (V.KChar 'j') [] -> modify $ \st -> st {_matchList = listMoveDown (_matchList st)}
     V.EvKey (V.KChar 'k') [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
-    -- Toggle search types
     V.EvKey (V.KChar 'l') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Literal
     V.EvKey (V.KChar 'i') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Identifier
     V.EvKey (V.KChar 'f') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
@@ -407,7 +430,15 @@ handleBrowseModeEvent e =
     V.EvKey (V.KChar 'x') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
     _ -> return ()
 
--- | Open the selected match in $EDITOR
+copyToClipboard :: MatchWithContext -> IO ()
+copyToClipboard mwc = do
+    let match    = _mwcMatch mwc
+        filepath = _mwcFilePath mwc
+        lineNum  = matchLine match
+        text     = filepath ++ ":" ++ show lineNum
+    _ <- readProcess "pbcopy" [] text
+    pure ()
+
 openInEditor :: MatchWithContext -> IO ()
 openInEditor mwc = do
   let match = _mwcMatch mwc
@@ -419,15 +450,27 @@ openInEditor mwc = do
     Nothing -> putStrLn "Error: $EDITOR not set. Cannot open file."
     Just editor -> do
       -- Most editors support +line syntax (vim, emacs, nano, etc.)
-      let command = editor ++ " +" ++ show lineNum ++ " " ++ show filepath
-      callCommand command
+      case editor of
+        "vim" -> let command = plusLineSyntax lineNum filepath editor
+                 in callCommand command
+        "emacs" -> let command = plusLineSyntax lineNum filepath editor
+                   in callCommand command
+        "nano"-> let command = plusLineSyntax lineNum filepath editor
+                   in callCommand command
+        _ -> let command = suffixLineSyntax lineNum filepath editor
+             in callCommand command
+
+plusLineSyntax:: Int -> String -> String -> String
+plusLineSyntax lineNum filepath editor = editor ++ " +" ++ show lineNum ++ " " ++ show filepath
+
+suffixLineSyntax:: Int -> String -> String -> String
+suffixLineSyntax lineNum filepath editor = editor ++  " " ++ show filepath ++ ":" ++ show lineNum
 
 toggleSearchType :: SearchType -> [SearchType] -> [SearchType]
 toggleSearchType t ts
   | t `elem` ts = filter (/= t) ts
   | otherwise = t : ts
 
--- | Attribute map
 theMap :: AttrMap
 theMap =
   attrMap
@@ -493,7 +536,7 @@ runSearchResultsTUIWithAsync previousMatches pattern path exts types searchActio
   _ <- forkIO $ searchAction eventChan
 
   initialVty <- buildVty
-  let initState = (initialState previousMatches pattern path exts types) & loadingState .~ Loading 0 1
+  let initState = (initialState previousMatches pattern path exts types) & loadingState .~ SearchingCache
   finalState <- customMain initialVty buildVty (Just eventChan) app initState
 
   -- Extract search parameters from final state

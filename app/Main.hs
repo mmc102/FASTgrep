@@ -2,13 +2,15 @@
 
 module Main where
 
+import Brick.BChan (BChan, newBChan, writeBChan)
+import Control.Concurrent (forkIO)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
-import Control.Concurrent (forkIO)
 import Control.Monad (filterM, foldM, forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, isPrefixOf, isSuffixOf)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -24,9 +26,8 @@ import System.Exit (exitSuccess, exitWith)
 import System.FilePath (takeExtension, takeFileName)
 import System.FilePath qualified as FP
 import System.IO (hFlush, stdout)
-import TreeSitter.Tree (Tree)
 import TUI (AppEvent (..), MatchWithContext (..), ResultsAction (..), SearchParams (..), runInteractiveTUI, runSearchResultsTUI, runSearchResultsTUIWithAsync, spExtensions, spPath, spPattern, spSearchTypes)
-import Brick.BChan (BChan, newBChan, writeBChan)
+import TreeSitter.Tree (Tree)
 
 -- | Cached AST data for a file
 data CachedAST = CachedAST
@@ -131,7 +132,7 @@ printBanner = do
 runSearch :: Options -> IO ()
 runSearch opts = do
   case searchPattern opts of
-    Nothing -> runInteractiveSearchLoop opts  -- Launch interactive TUI when no pattern
+    Nothing -> runInteractiveSearchLoop opts -- Launch interactive TUI when no pattern
     Just pattern -> do
       isFile <- doesFileExist (targetPath opts)
       isDir <- doesDirectoryExist (targetPath opts)
@@ -147,6 +148,7 @@ runSearch opts = do
                   then collectMatchesFromDirectory opts (targetPath opts)
                   else do
                     putStrLn $ "Error: " ++ targetPath opts ++ " is not a valid file or directory"
+
                     return []
           (action, newParams) <- runSearchResultsTUI matchesWithContext pattern (targetPath opts) (fileExtensions opts) (searchTypes opts)
           case action of
@@ -166,7 +168,7 @@ runInteractiveSearchLoop :: Options -> IO ()
 runInteractiveSearchLoop opts = do
   maybeParams <- runInteractiveTUI opts
   case maybeParams of
-    Nothing -> return ()  -- User quit
+    Nothing -> return () -- User quit
     Just params -> runSearchWithParams params
 
 -- | Run search with given parameters - builds cache on first run
@@ -180,54 +182,53 @@ runSearchWithCache params maybeCache = runSearchWithCacheAndResults params maybe
 -- | Run search with cache and previous results
 runSearchWithCacheAndResults :: SearchParams -> Maybe ASTCache -> [MatchWithContext] -> IO ()
 runSearchWithCacheAndResults params maybeCache previousResults = do
-  let searchOpts = Options
-        { searchPattern = Just (spPattern params),
-          searchTypes = spSearchTypes params,
-          targetPath = spPath params,
-          fileExtensions = spExtensions params,
-          tuiMode = True
-        }
+  let searchOpts =
+        Options
+          { searchPattern = Just (spPattern params),
+            searchTypes = spSearchTypes params,
+            targetPath = spPath params,
+            fileExtensions = spExtensions params,
+            tuiMode = True
+          }
 
-  -- Build cache synchronously if needed (only on first search or path change)
-  cache <- case maybeCache of
-    Just c -> return c
-    Nothing -> do
-      -- Build cache synchronously before launching TUI
-      -- We show loading in the TUI itself for searches
-      isFile <- doesFileExist (spPath params)
-      isDir <- doesDirectoryExist (spPath params)
+  -- Create IORef to capture the built cache
+  cacheRef <- newIORef maybeCache
 
-      if isFile
-        then do
-          cached <- cacheFile searchOpts (spPath params)
-          return $ maybe Map.empty (\c -> Map.singleton (spPath params) c) cached
-        else if isDir
-          then cacheDirectory searchOpts (spPath params)
-          else return Map.empty
-
-  -- Create async search action that uses the cache
+  -- Create async search action that builds cache if needed, then searches
   let searchAction chan = do
-        -- Perform search on cached ASTs (runs in background thread)
+        -- Build cache if needed
+        cache <- case maybeCache of
+          Just c -> return c
+          Nothing -> do
+            newCache <- buildASTCacheWithProgress searchOpts (spPath params) chan
+            writeIORef cacheRef (Just newCache)
+            return newCache
+
+        -- Perform search on cached ASTs
         let matchesWithContext = searchCachedASTs cache (spPattern params) (spSearchTypes params)
 
         -- Send results
         writeBChan chan (SearchComplete matchesWithContext)
 
   -- Run TUI with async search
-  (action, newParams) <- runSearchResultsTUIWithAsync
-    previousResults
-    (spPattern params)
-    (spPath params)
-    (spExtensions params)
-    (spSearchTypes params)
-    searchAction
+  (action, newParams) <-
+    runSearchResultsTUIWithAsync
+      previousResults
+      (spPattern params)
+      (spPath params)
+      (spExtensions params)
+      (spSearchTypes params)
+      searchAction
+
+  -- Get the final cache state
+  finalCache <- readIORef cacheRef
 
   case action of
     NewSearch -> do
       -- Check if we need to rebuild cache
       if spPath newParams /= spPath params || spExtensions newParams /= spExtensions params
         then runSearchWithCacheAndResults newParams Nothing []
-        else runSearchWithCacheAndResults newParams (Just cache) []  -- Pass the cache!
+        else runSearchWithCacheAndResults newParams finalCache [] -- Pass the cache!
     Quit -> return ()
 
 -- | Build AST cache with progress updates sent via BChan
@@ -240,9 +241,10 @@ buildASTCacheWithProgress opts path chan = do
     then do
       cache <- cacheFileWithProgress opts path chan 1 1
       return $ maybe Map.empty (\c -> Map.singleton path c) cache
-    else if isDir
-      then cacheDirectoryWithProgress opts path chan
-      else return Map.empty
+    else
+      if isDir
+        then cacheDirectoryWithProgress opts path chan
+        else return Map.empty
 
 -- | Count total files to parse
 countFiles :: Options -> FilePath -> IO Int
@@ -252,9 +254,10 @@ countFiles opts path = do
 
   if isFile
     then return 1
-    else if isDir
-      then countFilesInDirectory opts path
-      else return 0
+    else
+      if isDir
+        then countFilesInDirectory opts path
+        else return 0
 
 -- | Count files in directory
 countFilesInDirectory :: Options -> FilePath -> IO Int
@@ -268,8 +271,13 @@ countFilesInDirectory opts dir = do
   files <- filterM doesFileExist fullPaths
   dirs <- filterM doesDirectoryExist fullPaths
 
-  let matchingFiles = filter (\f -> let ext = takeExtension f
-                                     in null (fileExtensions opts) || ext `elem` fileExtensions opts) files
+  let matchingFiles =
+        filter
+          ( \f ->
+              let ext = takeExtension f
+               in null (fileExtensions opts) || ext `elem` fileExtensions opts
+          )
+          files
 
   dirCounts <- mapM (countFilesInDirectory opts) dirs
   return $ length matchingFiles + sum dirCounts
@@ -296,25 +304,41 @@ cacheDirectoryWithProgressHelper opts dir chan currentCount totalFiles = do
   dirs <- filterM doesDirectoryExist fullPaths
 
   -- Cache files with progress
-  (fileCaches, newCount) <- foldM (\(caches, count) file -> do
-      maybeCache <- cacheFileWithProgress opts file chan count totalFiles
-      return (case maybeCache of
+  (fileCaches, newCount) <-
+    foldM
+      ( \(caches, count) file -> do
+          maybeCache <- cacheFileWithProgress opts file chan count totalFiles
+          let newCount = count + 1
+          return
+            ( case maybeCache of
                 Just cache -> Map.singleton file cache : caches
                 Nothing -> caches,
-              count + 1)
-    ) ([], currentCount) files
+              newCount
+            )
+      )
+      ([], currentCount)
+      files
 
-  -- Cache subdirectories
-  (dirCaches, _) <- foldM (\(caches, count) subdir -> do
-      cache <- cacheDirectoryWithProgressHelper opts subdir chan count totalFiles
-      return (cache : caches, count + Map.size cache)
-    ) ([], newCount) dirs
+  -- Cache subdirectories (pass count through recursively)
+  (dirCaches, finalCount) <-
+    foldM
+      ( \(caches, count) subdir -> do
+          cache <- cacheDirectoryWithProgressHelper opts subdir chan count totalFiles
+          -- Count how many files were in this directory
+          subFiles <- countFilesInDirectory opts subdir
+          return (cache : caches, count + subFiles)
+      )
+      ([], newCount)
+      dirs
 
   return $ Map.unions (fileCaches ++ dirCaches)
 
 -- | Cache a single file with progress update
 cacheFileWithProgress :: Options -> FilePath -> BChan AppEvent -> Int -> Int -> IO (Maybe CachedAST)
 cacheFileWithProgress opts file chan currentCount totalFiles = do
+  -- Send progress update first
+  writeBChan chan (UpdateProgress (currentCount + 1) totalFiles)
+
   let ext = takeExtension file
       shouldCache = null (fileExtensions opts) || ext `elem` fileExtensions opts
 
@@ -329,14 +353,14 @@ cacheFileWithProgress opts file chan currentCount totalFiles = do
         case parseFile lang content of
           Left _err -> return Nothing
           Right tree -> do
-            -- Send progress update
-            writeBChan chan (UpdateProgress currentCount totalFiles)
-            return $ Just CachedAST
-              { astTree = tree,
-                astContent = content,
-                astLines = fileLines,
-                astLang = lang
-              }
+            return $
+              Just
+                CachedAST
+                  { astTree = tree,
+                    astContent = content,
+                    astLines = fileLines,
+                    astLang = lang
+                  }
 
 -- | Build AST cache for all files in the given path
 buildASTCache :: Options -> FilePath -> IO ASTCache
@@ -348,11 +372,12 @@ buildASTCache opts path = do
     then do
       cache <- cacheFile opts path
       return $ maybe Map.empty (\c -> Map.singleton path c) cache
-    else if isDir
-      then cacheDirectory opts path
-      else do
-        putStrLn $ "Error: " ++ path ++ " is not a valid file or directory"
-        return Map.empty
+    else
+      if isDir
+        then cacheDirectory opts path
+        else do
+          putStrLn $ "Error: " ++ path ++ " is not a valid file or directory"
+          return Map.empty
 
 -- | Cache ASTs for all files in a directory
 cacheDirectory :: Options -> FilePath -> IO ASTCache
@@ -395,12 +420,14 @@ cacheFile opts file = do
         case parseFile lang content of
           Left _err -> return Nothing
           Right tree -> do
-            return $ Just CachedAST
-              { astTree = tree,
-                astContent = content,
-                astLines = fileLines,
-                astLang = lang
-              }
+            return $
+              Just
+                CachedAST
+                  { astTree = tree,
+                    astContent = content,
+                    astLines = fileLines,
+                    astLang = lang
+                  }
 
 -- | Search using cached ASTs
 searchCachedASTs :: ASTCache -> String -> [SearchType] -> [MatchWithContext]
@@ -425,17 +452,17 @@ collectMatchesFromDirectory opts dir = do
   -- Process files strictly to avoid accumulating file handles
   fileMatches <- fmap concat $ forM files $ \file -> do
     matches <- collectMatchesFromFile opts file
-    evaluate (length matches)  -- Force evaluation before moving to next file
+    evaluate (length matches) -- Force evaluation before moving to next file
     return matches
 
   -- Process directories strictly
   dirMatches <- fmap concat $ forM dirs $ \subdir -> do
     matches <- collectMatchesFromDirectory opts subdir
-    evaluate (length matches)  -- Force evaluation before moving to next directory
+    evaluate (length matches) -- Force evaluation before moving to next directory
     return matches
 
   let allMatches = fileMatches ++ dirMatches
-  evaluate (length allMatches)  -- Force evaluation of combined results
+  evaluate (length allMatches) -- Force evaluation of combined results
   return allMatches
 
 collectMatchesFromFile :: Options -> FilePath -> IO [MatchWithContext]
@@ -452,21 +479,21 @@ collectMatchesFromFile opts file = do
           Nothing -> return []
           Just lang -> do
             content <- BS.readFile file
-            evaluate (BS.length content)  -- Force strict evaluation to close file handle
-            let fileLines = lines (BS8.unpack content)  -- Convert ByteString to lines instead of reading twice
+            evaluate (BS.length content)
+            let fileLines = lines (BS8.unpack content) -- Convert ByteString to lines instead of reading twice
             case parseFile lang content of
               Left _err -> return []
               Right tree -> do
                 let matches = findMatches (searchTypes opts) pattern tree content
                     results = map (createMatchWithContext file fileLines) matches
-                evaluate (length results)  -- Force evaluation of results
+                evaluate (length results) -- Force evaluation of results
                 return results
 
 createMatchWithContext :: FilePath -> [String] -> Match -> MatchWithContext
 createMatchWithContext file fileLines match =
   let lineNum = matchLine match
-      contextBefore = 2
-      contextAfter = 2
+      contextBefore = 4
+      contextAfter = 4
       startLine = max 1 (lineNum - contextBefore)
       endLine = min (length fileLines) (lineNum + contextAfter)
       contextLines = zip [startLine .. endLine] (take (endLine - startLine + 1) $ drop (startLine - 1) fileLines)
@@ -555,7 +582,7 @@ searchFile opts file = do
           Nothing -> return ()
           Just lang -> do
             content <- BS.readFile file
-            let fileLines = lines (BS8.unpack content)  -- Convert ByteString to lines instead of reading twice
+            let fileLines = lines (BS8.unpack content) -- Convert ByteString to lines instead of reading twice
             case parseFile lang content of
               Left _err -> return ()
               Right tree -> do
