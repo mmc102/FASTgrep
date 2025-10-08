@@ -28,6 +28,7 @@ import Lens.Micro.Mtl (zoom)
 import Lens.Micro.TH (makeLenses)
 import Matcher
 import System.Environment (lookupEnv)
+import System.IO (readFile, writeFile)
 import System.Process (callCommand, readProcess)
 
 -- | A match with file context
@@ -65,6 +66,7 @@ data Name
   | PatternEditor
   | PathEditor
   | ExtensionEditor
+  | ReplaceEditor
   deriving (Eq, Ord, Show)
 
 -- | Loading state
@@ -80,9 +82,11 @@ data AppState = AppState
     _patternEdit :: E.Editor Text Name,
     _pathEdit :: E.Editor Text Name,
     _extensionEdit :: E.Editor Text Name,
+    _replaceEdit :: E.Editor Text Name,  -- Replace text input
     _searchTypes'' :: [SearchType],
     _focusRing :: F.FocusRing Name,
     _searchFocused :: Bool,  -- Whether search input is focused
+    _replaceFocused :: Bool,  -- Whether replace input is focused
     _resultAction :: Maybe ResultsAction,
     _statusMessage :: Maybe String,  -- For showing status
     _loadingState :: LoadingState,  -- Loading progress
@@ -99,9 +103,11 @@ initialState matches pattern path exts types =
       _patternEdit = E.editor PatternEditor (Just 1) (T.pack pattern),
       _pathEdit = E.editor PathEditor (Just 1) (T.pack path),
       _extensionEdit = E.editor ExtensionEditor (Just 1) (T.pack $ unwords exts),
+      _replaceEdit = E.editor ReplaceEditor (Just 1) "",
       _searchTypes'' = types,
       _focusRing = F.focusRing [PatternEditor, PathEditor, ExtensionEditor],
       _searchFocused = False,
+      _replaceFocused = False,
       _resultAction = Nothing,
       _statusMessage = Nothing,
       _loadingState = NotLoading,
@@ -110,13 +116,16 @@ initialState matches pattern path exts types =
 
 drawUI :: AppState -> [Widget Name]
 drawUI st =
-  case st ^. loadingState of
-    LoadingCache parsed total ->
-      [drawCacheBuildingOverlay parsed total, mainUI st]
-    SearchingCache ->
-      [drawSearchingOverlay, mainUI st]
-    NotLoading ->
-      [mainUI st]
+  let baseUI = case st ^. loadingState of
+        LoadingCache parsed total ->
+          [drawCacheBuildingOverlay parsed total, mainUI st]
+        SearchingCache ->
+          [drawSearchingOverlay, mainUI st]
+        NotLoading ->
+          [mainUI st]
+   in if st ^. replaceFocused
+        then drawReplaceDialog st : baseUI
+        else baseUI
 
 mainUI :: AppState -> Widget Name
 mainUI st = vBox
@@ -163,6 +172,61 @@ drawSearchingOverlay =
             [ withAttr (attrName "header") $ str "🔍 Searching..",
               str " "
             ]
+
+drawReplaceDialog :: AppState -> Widget Name
+drawReplaceDialog st =
+  let searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
+      replaceText = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. replaceEdit)
+      (captureInfo, matchedText, previewText) = case listSelectedElement (st ^. matchList) of
+        Nothing -> ([], "", "")
+        Just (_, mwc) ->
+          let match = _mwcMatch mwc
+              matched = matchText match
+           in case matched =~ searchPattern :: (String, String, String, [String]) of
+                (_, "", _, _) -> ([], matched, "")
+                (_, fullMatch, _, captures) ->
+                  let preview = if null replaceText
+                                  then ""
+                                  else substituteCaptures replaceText fullMatch captures
+                   in (captures, matched, preview)
+      captureWidget = if null captureInfo
+                        then emptyWidget
+                        else vBox
+                          [ str " ",
+                            str "Capture groups:",
+                            vBox $ zipWith (\i cap -> str $ "  \\" ++ show i ++ " = " ++ cap) [1..] captureInfo,
+                            str " "
+                          ]
+      previewWidget = if null previewText
+                        then emptyWidget
+                        else vBox
+                          [ str " ",
+                            hBox
+                              [ str "Preview: ",
+                                withAttr (attrName "type-literal") $ str matchedText,
+                                str " → ",
+                                withAttr (attrName "type-function-call") $ str previewText
+                              ],
+                            str " "
+                          ]
+   in centerLayer $
+        withBorderStyle unicodeBold $
+          border $
+            padAll 2 $
+              vBox
+                [ withAttr (attrName "header") $ str "Replace",
+                  str " ",
+                  hBox [ str "Replace with: ",
+                         hLimit 50 $ vLimit 1 $
+                           withAttr (attrName "focused") $
+                           E.renderEditor (txt . T.unlines) True (st ^. replaceEdit)
+                       ],
+                  captureWidget,
+                  previewWidget,
+                  str "Use \\1, \\2, etc. for capture groups | Use \\0 for full match",
+                  str " ",
+                  str "Enter: replace current | Ctrl+A: replace all | ESC: cancel"
+                ]
 
 drawProgressBar :: Int -> Int -> Widget Name
 drawProgressBar parsed total =
@@ -345,7 +409,7 @@ drawHelp appState =
   padLeftRight 1 $
     if appState ^. searchFocused
       then str "Tab: next field | ESC: unfocus | Enter: search | l/i/c/d/t: toggle types"
-      else str "f/s/n: focus search | ↑,j/↓,k: navigate | y: copy | o: open in $EDITOR | l/i/c/d/t: toggle types | Enter: search | q: quit"
+      else str "f/s/n: focus search | ↑,j/↓,k: navigate | y: copy | o: open | r: replace | l/i/c/d/t: toggle types | Enter: search | q: quit"
 
 getMatchTypeLabel :: SearchType -> String
 getMatchTypeLabel Literal = "[LIT]"
@@ -366,9 +430,11 @@ getMatchTypeAttr JsxText = attrName "type-jsx-text"
 handleEvent :: BrickEvent Name AppEvent -> EventM Name AppState ()
 handleEvent (VtyEvent e) = do
   st <- get
-  if st ^. searchFocused
-    then handleSearchModeEvent e  -- Search input is focused
-    else handleBrowseModeEvent e  -- Browsing results
+  if st ^. replaceFocused
+    then handleReplaceModeEvent e  -- Replace input is focused
+    else if st ^. searchFocused
+      then handleSearchModeEvent e  -- Search input is focused
+      else handleBrowseModeEvent e  -- Browsing results
 handleEvent (AppEvent (SearchComplete matches)) = do
   -- Update results when search completes
   modify $ \st -> st
@@ -455,6 +521,7 @@ handleBrowseModeEvent e =
         Just (_, mwc) -> suspendAndResume $ do
           copyToClipboard mwc
           return st
+    V.EvKey (V.KChar 'r') [] -> modify $ \st -> st & replaceFocused .~ True
     V.EvKey V.KDown [] -> modify $ \st -> st {_matchList = listMoveDown (_matchList st)}
     V.EvKey V.KUp [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
     V.EvKey (V.KChar 'j') [] -> modify $ \st -> st {_matchList = listMoveDown (_matchList st)}
@@ -465,6 +532,36 @@ handleBrowseModeEvent e =
     V.EvKey (V.KChar 'd') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionDef
     V.EvKey (V.KChar 't') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
     _ -> return ()
+
+-- | Handle events when replace dialog is open
+handleReplaceModeEvent :: V.Event -> EventM Name AppState ()
+handleReplaceModeEvent e =
+  case e of
+    V.EvKey V.KEsc [] -> modify $ \st -> st & replaceFocused .~ False & replaceEdit .~ E.editor ReplaceEditor (Just 1) ""
+    V.EvKey V.KEnter [] -> do
+      st <- get
+      let replaceText = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. replaceEdit)
+          searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
+      case listSelectedElement (st ^. matchList) of
+        Nothing -> return ()
+        Just (_, mwc) -> suspendAndResume $ do
+          performReplace searchPattern replaceText mwc
+          -- Close dialog and trigger re-search by setting resultAction to NewSearch
+          return $ st & replaceFocused .~ False
+                      & replaceEdit .~ E.editor ReplaceEditor (Just 1) ""
+                      & resultAction .~ Just NewSearch
+    V.EvKey (V.KChar 'a') [V.MCtrl] -> do
+      st <- get
+      let replaceText = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. replaceEdit)
+          searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
+          allMatches = Vec.toList $ listElements (st ^. matchList)
+      suspendAndResume $ do
+        performReplaceAll searchPattern replaceText allMatches
+        -- Close dialog and trigger re-search by setting resultAction to NewSearch
+        return $ st & replaceFocused .~ False
+                    & replaceEdit .~ E.editor ReplaceEditor (Just 1) ""
+                    & resultAction .~ Just NewSearch
+    _ -> zoom replaceEdit $ E.handleEditorEvent (VtyEvent e)
 
 copyToClipboard :: MatchWithContext -> IO ()
 copyToClipboard mwc = do
@@ -501,6 +598,87 @@ plusLineSyntax lineNum filepath editor = editor ++ " +" ++ show lineNum ++ " " +
 
 suffixLineSyntax:: Int -> String -> String -> String
 suffixLineSyntax lineNum filepath editor = editor ++  " " ++ show filepath ++ ":" ++ show lineNum
+
+-- | Replace capture group placeholders like \1, \2 with actual captured text
+substituteCaptures :: String -> String -> [String] -> String
+substituteCaptures replacement fullMatch captures = go replacement
+  where
+    go [] = []
+    go ('\\':d:rest) | d >= '0' && d <= '9' =
+      let idx = read [d] :: Int
+          capture = if idx == 0
+                      then fullMatch
+                      else if idx <= length captures
+                             then captures !! (idx - 1)
+                             else "\\" ++ [d]  -- Keep literal if index out of range
+       in capture ++ go rest
+    go (c:rest) = c : go rest
+
+-- | Replace the search pattern on a single match
+performReplace :: String -> String -> MatchWithContext -> IO ()
+performReplace searchPattern replaceText mwc = do
+  let filepath = _mwcFilePath mwc
+      match = _mwcMatch mwc
+      lineNum = matchLine match
+
+  -- Read file
+  content <- System.IO.readFile filepath
+  let fileLines = lines content
+
+  -- Replace on the matched line only
+  if lineNum > 0 && lineNum <= length fileLines
+    then do
+      let targetLine = fileLines !! (lineNum - 1)
+          -- Use regex substitution with capture group support
+          replacedLine = case targetLine =~ searchPattern :: (String, String, String, [String]) of
+            (_, "", _, _) -> targetLine  -- No match found
+            (before, matched, after, captures) ->
+              let substituted = substituteCaptures replaceText matched captures
+               in before ++ substituted ++ after
+          modifiedLines = take (lineNum - 1) fileLines ++ [replacedLine] ++ drop lineNum fileLines
+
+      -- Write back
+      System.IO.writeFile filepath (unlines modifiedLines)
+    else
+      putStrLn $ "Error: Line " ++ show lineNum ++ " out of range in " ++ filepath
+
+-- | Replace all occurrences across all matches
+performReplaceAll :: String -> String -> [MatchWithContext] -> IO ()
+performReplaceAll searchPattern replaceText matches = do
+  -- Group matches by file
+  let groupedByFile = foldr groupByFile [] matches
+
+  -- For each file, perform all replacements
+  mapM_ (replaceInFile searchPattern replaceText) groupedByFile
+  where
+    groupByFile :: MatchWithContext -> [(FilePath, [MatchWithContext])] -> [(FilePath, [MatchWithContext])]
+    groupByFile mwc [] = [(_mwcFilePath mwc, [mwc])]
+    groupByFile mwc ((fp, mwcs):rest)
+      | _mwcFilePath mwc == fp = (fp, mwc:mwcs) : rest
+      | otherwise = (fp, mwcs) : groupByFile mwc rest
+
+    replaceInFile :: String -> String -> (FilePath, [MatchWithContext]) -> IO ()
+    replaceInFile pattern replacement (filepath, mwcs) = do
+      content <- System.IO.readFile filepath
+      let fileLines = lines content
+          -- Get all line numbers to replace (sorted in descending order to preserve line numbers)
+          lineNums = map (matchLine . _mwcMatch) mwcs
+          -- Perform replacements
+          modifiedLines = replaceLines pattern replacement fileLines lineNums 1
+
+      System.IO.writeFile filepath (unlines modifiedLines)
+
+    replaceLines :: String -> String -> [String] -> [Int] -> Int -> [String]
+    replaceLines _ _ [] _ _ = []
+    replaceLines pattern replacement (line:rest) targets currentLine =
+      let newLine = if currentLine `elem` targets
+                      then case line =~ pattern :: (String, String, String, [String]) of
+                        (_, "", _, _) -> line  -- No match
+                        (before, matched, after, captures) ->
+                          let substituted = substituteCaptures replacement matched captures
+                           in before ++ substituted ++ after
+                      else line
+       in newLine : replaceLines pattern replacement rest targets (currentLine + 1)
 
 toggleSearchType :: SearchType -> [SearchType] -> [SearchType]
 toggleSearchType t ts

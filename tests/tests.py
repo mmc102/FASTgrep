@@ -2,7 +2,7 @@ def cat()->None:
     pass
 
 cat = "oliver"
-pet = "cat"
+pet = "snoopdoggdoggggggy"
 
 lookup = {
     cat: pet
