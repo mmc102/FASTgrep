@@ -13,6 +13,7 @@ import Brick.Widgets.Edit qualified as E
 import Brick.Widgets.List
 import Control.Concurrent (forkIO)
 import Control.Monad (void, when)
+import Data.Char (toLower)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -275,6 +276,9 @@ drawMatchDetail st =
           typeLabel = getMatchTypeLabel (matchType match)
           contextLines = _mwcContextLines mwc
           matchLineNum = matchLine match
+          matchedText = matchText match
+          -- Get the search pattern from the editor
+          searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
        in vBox
             [ padLeftRight 1 $
                 withAttr (attrName "detail-header") $
@@ -283,19 +287,38 @@ drawMatchDetail st =
               padLeftRight 1 $
                 str $
                   "Location: " ++ filepath ++ ":" ++ show matchLineNum ++ ":" ++ show (matchColumn match),
+              padLeftRight 1 $
+                hBox
+                  [ str "Match: ",
+                    withAttr (getMatchTypeAttr (matchType match)) $ str matchedText
+                  ],
               hBorder,
               padLeft (Pad 2) $
                 vBox $
-                  map (drawContextLine matchLineNum match) contextLines
+                  map (drawContextLine matchLineNum match searchPattern) contextLines
             ]
 
-drawContextLine :: Int -> Match -> (Int, String) -> Widget Name
-drawContextLine matchLineNum match (lineNum, lineText) =
+drawContextLine :: Int -> Match -> String -> (Int, String) -> Widget Name
+drawContextLine matchLineNum match searchPattern (lineNum, lineText) =
   let isMatchLine = lineNum == matchLineNum
       lineNumStr = padLeft (Pad (4 - length (show lineNum))) $ str (show lineNum)
       lineWidget =
         if isMatchLine
-          then withAttr (getMatchTypeAttr (matchType match)) $ str lineText
+          then
+            -- Highlight the search pattern within the line
+            case findSubstring searchPattern lineText of
+              Just idx ->
+                let before = take idx lineText
+                    highlighted = take (length searchPattern) (drop idx lineText)
+                    after = drop (idx + length searchPattern) lineText
+                 in hBox
+                      [ withAttr (attrName "context") $ str before,
+                        withAttr (getMatchTypeAttr (matchType match)) $ str highlighted,
+                        withAttr (attrName "context") $ str after
+                      ]
+              Nothing ->
+                -- Fallback: highlight the whole matched node
+                withAttr (getMatchTypeAttr (matchType match)) $ str lineText
           else withAttr (attrName "context") $ str lineText
    in hBox
         [ if isMatchLine
@@ -304,6 +327,16 @@ drawContextLine matchLineNum match (lineNum, lineText) =
           str " │ ",
           lineWidget
         ]
+
+-- | Find the index of a substring within a string (case-insensitive search)
+findSubstring :: String -> String -> Maybe Int
+findSubstring needle haystack = go 0 haystack
+  where
+    needleLower = map toLower needle
+    go _ [] = Nothing
+    go idx str@(_:rest)
+      | take (length needle) (map toLower str) == needleLower = Just idx
+      | otherwise = go (idx + 1) rest
 
 drawHelp :: AppState -> Widget Name
 drawHelp appState =

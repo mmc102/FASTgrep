@@ -69,15 +69,22 @@ traverseWithCursor searchTypes pattern cursor sourceCode = do
          in if any (`matchesType` nodeTypeStr) targetTypes
               then checkNodeContent pattern currentNode sourceCode st
               else []
-      currentMatches = concatMap checkType typesToCheck
 
   hasChild <- ts_tree_cursor_goto_first_child cursor
   if hasChild
     then do
+      -- First get matches from children
       siblingMatches <- processSiblings searchTypes pattern cursor sourceCode []
       _ <- ts_tree_cursor_goto_parent cursor
+
+      -- Only include current node's matches if no children matched
+      let currentMatches = if null siblingMatches
+                             then concatMap checkType typesToCheck
+                             else []
       return (currentMatches ++ siblingMatches)
-    else
+    else do
+      -- Leaf node - check for matches
+      let currentMatches = concatMap checkType typesToCheck
       return currentMatches
 
 processSiblings :: [SearchType] -> String -> Ptr Cursor -> ByteString -> [Match] -> IO [Match]
