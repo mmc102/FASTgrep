@@ -105,7 +105,7 @@ matchesType target nodeTypeStr =
 
 checkNodeContent :: String -> Node -> ByteString -> SearchType -> [Match]
 checkNodeContent pattern node sourceCode searchType
-  | null pattern = []  -- Empty pattern matches nothing
+  | null pattern = [] -- Empty pattern matches nothing
   | otherwise =
       let startPoint = nodeStartPoint node
           startByte = fromIntegral (nodeStartByte node)
@@ -121,7 +121,7 @@ checkNodeContent pattern node sourceCode searchType
             -- For other types, check the entire node
             _ ->
               let matches = nodeTextStr =~ pattern :: Bool
-               in [ Match startLine startCol nodeTextStr searchType | matches ]
+               in [Match startLine startCol nodeTextStr searchType | matches]
 
 -- | For functions, only check if the function name matches (not the entire body/args)
 checkFunctionName :: String -> Node -> ByteString -> SearchType -> [Match]
@@ -135,7 +135,7 @@ checkFunctionName pattern node sourceCode searchType = unsafePerformIO $ do
   nameNode <- findNameNode tsNode childCount
 
   case nameNode of
-    Nothing -> return []  -- No name node found, don't match
+    Nothing -> return [] -- No name node found, don't match
     Just name -> do
       let startPoint = nodeStartPoint name
           startByte = fromIntegral (nodeStartByte name)
@@ -150,9 +150,8 @@ checkFunctionName pattern node sourceCode searchType = unsafePerformIO $ do
           fullEndByte = fromIntegral (nodeEndByte node)
           fullNodeText = BS.take (fullEndByte - fullStartByte) $ BS.drop fullStartByte sourceCode
           fullNodeTextStr = BS8.unpack fullNodeText
-      return [ Match startLine startCol fullNodeTextStr searchType | matches ]
+      return [Match startLine startCol fullNodeTextStr searchType | matches]
 
--- | Find the name node within a function def or call using cursor
 findNameNode :: TSNode -> Word32 -> IO (Maybe Node)
 findNameNode tsNode childCount
   | childCount == 0 = return Nothing
@@ -170,7 +169,7 @@ findNameNode tsNode childCount
         _ <- ts_tree_cursor_current_node_p cursor ptr
         peek ptr
       nodeTypeStr <- peekCString (nodeType currentNode)
-      -- Look for identifier or name nodes
+
       if nodeTypeStr `elem` ["identifier", "name", "property_identifier"]
         then return (Just currentNode)
         else do

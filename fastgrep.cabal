@@ -19,7 +19,7 @@ executable fastgrep
     other-modules:    TUI
     hs-source-dirs:   app
     default-language: GHC2021
-    ghc-options:      -threaded
+    ghc-options:      -threaded -with-rtsopts=-N
     build-depends:    base >=4.16
                     , fastgrep
                     , bytestring
@@ -40,6 +40,8 @@ executable fastgrep
                     , containers
                     , tree-sitter
                     , regex-tdfa
+                    , async
+                    , parallel
 
 library
     import:           warnings

@@ -4,7 +4,7 @@
 module TUI (runSearchResultsTUI, runSearchResultsTUIWithAsync, runInteractiveTUI, MatchWithContext (..), SearchParams (..), ResultsAction (..), AppEvent (..)) where
 
 import Brick
-import Brick.BChan (BChan, newBChan, writeBChan)
+import Brick.BChan (BChan, newBChan)
 import Brick.Focus qualified as F
 import Brick.Widgets.Border
 import Brick.Widgets.Border.Style
@@ -12,19 +12,18 @@ import Brick.Widgets.Center
 import Brick.Widgets.Edit qualified as E
 import Brick.Widgets.List
 import Control.Concurrent (forkIO)
-import Control.Monad (void, when)
-import Data.Char (toLower)
+import Control.Monad (when)
 import Data.Maybe (fromMaybe)
-import Text.Regex.TDFA ((=~), getAllTextMatches, makeRegex, matchOnce)
+import Text.Regex.TDFA ((=~))
 import Text.Regex.TDFA.String ()
+import Control.Exception (try, evaluate, SomeException)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Vector (Vector)
 import Data.Vector qualified as Vec
 import Graphics.Vty qualified as V
 import Graphics.Vty.CrossPlatform (mkVty)
 import Lens.Micro ((&), (^.), (.~), (%~))
-import Lens.Micro.Mtl (zoom)
 import Lens.Micro.TH (makeLenses)
 import Matcher
 import System.Environment (lookupEnv)
@@ -38,14 +37,14 @@ data MatchWithContext = MatchWithContext
     _mwcContextLines :: [(Int, String)]
   }
 
-makeLenses ''MatchWithContext
 
 -- | Search parameters to pass between TUI and Main
 data SearchParams = SearchParams
   { spPattern :: String,
     spPath :: FilePath,
     spExtensions :: [String],
-    spSearchTypes :: [SearchType]
+    spSearchTypes :: [SearchType],
+    spModifiedFiles :: [FilePath]  -- Files that were modified via replace
   }
   deriving (Show)
 
@@ -90,7 +89,8 @@ data AppState = AppState
     _resultAction :: Maybe ResultsAction,
     _statusMessage :: Maybe String,  -- For showing status
     _loadingState :: LoadingState,  -- Loading progress
-    _lastSearchParams :: Maybe (String, String, [String], [SearchType])  -- Last search parameters
+    _lastSearchParams :: Maybe (String, String, [String], [SearchType]),  -- Last search parameters
+    _modifiedFiles :: [FilePath]  -- Files modified via replace operations
   }
 
 makeLenses ''AppState
@@ -111,7 +111,8 @@ initialState matches pattern path exts types =
       _resultAction = Nothing,
       _statusMessage = Nothing,
       _loadingState = NotLoading,
-      _lastSearchParams = Just (pattern, path, exts, types)
+      _lastSearchParams = Just (pattern, path, exts, types),
+      _modifiedFiles = []
     }
 
 drawUI :: AppState -> [Widget Name]
@@ -177,35 +178,38 @@ drawReplaceDialog :: AppState -> Widget Name
 drawReplaceDialog st =
   let searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
       replaceText = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. replaceEdit)
-      (captureInfo, matchedText, previewText) = case listSelectedElement (st ^. matchList) of
+      (captureInfo, beforeText, afterText) = case listSelectedElement (st ^. matchList) of
         Nothing -> ([], "", "")
         Just (_, mwc) ->
           let match = _mwcMatch mwc
               matched = matchText match
-           in case matched =~ searchPattern :: (String, String, String, [String]) of
-                (_, "", _, _) -> ([], matched, "")
-                (_, fullMatch, _, captures) ->
-                  let preview = if null replaceText
-                                  then ""
-                                  else substituteCaptures replaceText fullMatch captures
-                   in (captures, matched, preview)
+           in case safeRegexMatch searchPattern matched of
+                Nothing -> ([], matched, matched)  -- Invalid regex or no match, show original
+                Just (before, fullMatch, after, captures) ->
+                  let substituted = if null replaceText
+                                      then fullMatch
+                                      else substituteCaptures replaceText fullMatch captures
+                      -- Show the entire node text with the replacement applied
+                      afterComplete = before ++ substituted ++ after
+                   in (captures, matched, afterComplete)
       captureWidget = if null captureInfo
                         then emptyWidget
                         else vBox
                           [ str " ",
                             str "Capture groups:",
-                            vBox $ zipWith (\i cap -> str $ "  \\" ++ show i ++ " = " ++ cap) [1..] captureInfo,
+                            str "  \\0 the full match",
+                            vBox $ zipWith (\i cap -> str $ "  \\" ++ show i ++ " = " ++ cap) [1 :: Int ..] captureInfo,
                             str " "
                           ]
-      previewWidget = if null previewText
+      previewWidget = if null afterText || beforeText == afterText
                         then emptyWidget
                         else vBox
                           [ str " ",
                             hBox
                               [ str "Preview: ",
-                                withAttr (attrName "type-literal") $ str matchedText,
+                                withAttr (attrName "type-literal") $ str beforeText,
                                 str " → ",
-                                withAttr (attrName "type-function-call") $ str previewText
+                                withAttr (attrName "type-function-call") $ str afterText
                               ],
                             str " "
                           ]
@@ -223,7 +227,6 @@ drawReplaceDialog st =
                        ],
                   captureWidget,
                   previewWidget,
-                  str "Use \\1, \\2, etc. for capture groups | Use \\0 for full match",
                   str " ",
                   str "Enter: replace current | Ctrl+A: replace all | ESC: cancel"
                 ]
@@ -320,11 +323,11 @@ renderMatch isSelected mwc =
       filepath = _mwcFilePath mwc
       typeLabel = getMatchTypeLabel (matchType match)
       locStr = filepath ++ ":" ++ show (matchLine match) ++ ":" ++ show (matchColumn match)
-      style =
+      _style =
         if isSelected
           then withAttr (attrName "selected")
           else id
-   in style $
+   in _style $
         padLeftRight 1 $
           hBox
             [ withAttr (getMatchTypeAttr (matchType match)) $ str typeLabel,
@@ -377,11 +380,11 @@ drawContextLine matchLineNum match searchPattern (lineNum, lineText) =
                 withAttr (getMatchTypeAttr (matchType match)) $ str lineText
               else
                 -- Highlight the search pattern within the line using regex
-                case lineText =~ searchPattern :: (String, String, String) of
-                  (before, "", _) ->
-                    -- No match - fallback to highlighting the whole matched node
+                case safeRegexMatch searchPattern lineText of
+                  Nothing ->
+                    -- Invalid regex or no match - fallback to highlighting the whole matched node
                     withAttr (getMatchTypeAttr (matchType match)) $ str lineText
-                  (before, matched, after) ->
+                  Just (before, matched, after, _) ->
                     -- Highlight the matched portion
                     hBox
                       [ withAttr (attrName "context") $ str before,
@@ -397,12 +400,6 @@ drawContextLine matchLineNum match searchPattern (lineNum, lineText) =
           lineWidget
         ]
 
--- | Find the index of a regex match within a string
-findSubstring :: String -> String -> Maybe Int
-findSubstring pattern haystack =
-  case haystack =~ pattern :: (String, String, String) of
-    (before, "", _) -> Nothing  -- No match
-    (before, _, _) -> Just (length before)  -- Return start index
 
 drawHelp :: AppState -> Widget Name
 drawHelp appState =
@@ -436,9 +433,19 @@ handleEvent (VtyEvent e) = do
       then handleSearchModeEvent e  -- Search input is focused
       else handleBrowseModeEvent e  -- Browsing results
 handleEvent (AppEvent (SearchComplete matches)) = do
-  -- Update results when search completes
-  modify $ \st -> st
-    & matchList .~ list MatchListName (Vec.fromList matches) 1
+  -- Update results when search completes, preserving scroll position
+  st <- get
+  let oldList = st ^. matchList
+      oldSelected = listSelected oldList
+      newList = list MatchListName (Vec.fromList matches) 1
+      -- Preserve the selection if it's still valid
+      finalList = case oldSelected of
+        Nothing -> newList
+        Just idx -> if idx < length matches
+                      then listMoveTo idx newList
+                      else newList
+  modify $ \_ -> st
+    & matchList .~ finalList
     & loadingState .~ NotLoading
 handleEvent (AppEvent (UpdateProgress parsed total)) = do
   -- Update progress bar for cache building
@@ -526,11 +533,26 @@ handleBrowseModeEvent e =
     V.EvKey V.KUp [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
     V.EvKey (V.KChar 'j') [] -> modify $ \st -> st {_matchList = listMoveDown (_matchList st)}
     V.EvKey (V.KChar 'k') [] -> modify $ \st -> st {_matchList = listMoveUp (_matchList st)}
-    V.EvKey (V.KChar 'l') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Literal
-    V.EvKey (V.KChar 'i') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType Identifier
-    V.EvKey (V.KChar 'c') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
-    V.EvKey (V.KChar 'd') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionDef
-    V.EvKey (V.KChar 't') [] -> modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
+    V.EvKey (V.KChar 'l') [] -> do
+      modify $ \st -> st & searchTypes'' %~ toggleSearchType Literal
+                         & resultAction .~ Just NewSearch
+      halt
+    V.EvKey (V.KChar 'i') [] -> do
+      modify $ \st -> st & searchTypes'' %~ toggleSearchType Identifier
+                         & resultAction .~ Just NewSearch
+      halt
+    V.EvKey (V.KChar 'c') [] -> do
+      modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionCall
+                         & resultAction .~ Just NewSearch
+      halt
+    V.EvKey (V.KChar 'd') [] -> do
+      modify $ \st -> st & searchTypes'' %~ toggleSearchType FunctionDef
+                         & resultAction .~ Just NewSearch
+      halt
+    V.EvKey (V.KChar 't') [] -> do
+      modify $ \st -> st & searchTypes'' %~ toggleSearchType JsxText
+                         & resultAction .~ Just NewSearch
+      halt
     _ -> return ()
 
 -- | Handle events when replace dialog is open
@@ -544,23 +566,36 @@ handleReplaceModeEvent e =
           searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
       case listSelectedElement (st ^. matchList) of
         Nothing -> return ()
-        Just (_, mwc) -> suspendAndResume $ do
-          performReplace searchPattern replaceText mwc
-          -- Close dialog and trigger re-search by setting resultAction to NewSearch
-          return $ st & replaceFocused .~ False
-                      & replaceEdit .~ E.editor ReplaceEditor (Just 1) ""
-                      & resultAction .~ Just NewSearch
+        Just (_, mwc) -> do
+          -- Perform the replacement
+          suspendAndResume $ do
+            performReplace searchPattern replaceText mwc
+            let filepath = _mwcFilePath mwc
+            -- Close dialog and trigger re-search by setting resultAction to NewSearch
+            -- Track the modified file
+            return $ st & replaceFocused .~ False
+                        & replaceEdit .~ E.editor ReplaceEditor (Just 1) ""
+                        & resultAction .~ Just NewSearch
+                        & modifiedFiles %~ (filepath :)
+          -- Exit the TUI to trigger re-search
+          halt
     V.EvKey (V.KChar 'a') [V.MCtrl] -> do
       st <- get
       let replaceText = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. replaceEdit)
           searchPattern = T.unpack $ T.strip $ T.unlines $ E.getEditContents (st ^. patternEdit)
           allMatches = Vec.toList $ listElements (st ^. matchList)
+          affectedFiles = map _mwcFilePath allMatches
+      -- Perform the replacement
       suspendAndResume $ do
         performReplaceAll searchPattern replaceText allMatches
         -- Close dialog and trigger re-search by setting resultAction to NewSearch
+        -- Track all modified files
         return $ st & replaceFocused .~ False
                     & replaceEdit .~ E.editor ReplaceEditor (Just 1) ""
                     & resultAction .~ Just NewSearch
+                    & modifiedFiles %~ (++ affectedFiles)
+      -- Exit the TUI to trigger re-search
+      halt
     _ -> zoom replaceEdit $ E.handleEditorEvent (VtyEvent e)
 
 copyToClipboard :: MatchWithContext -> IO ()
@@ -599,6 +634,17 @@ plusLineSyntax lineNum filepath editor = editor ++ " +" ++ show lineNum ++ " " +
 suffixLineSyntax:: Int -> String -> String -> String
 suffixLineSyntax lineNum filepath editor = editor ++  " " ++ show filepath ++ ":" ++ show lineNum
 
+-- | Safe regex match that handles invalid patterns
+safeRegexMatch :: String -> String -> Maybe (String, String, String, [String])
+safeRegexMatch pattern text = unsafePerformIO $ do
+  result <- try (evaluate (text =~ pattern :: (String, String, String, [String]))) :: IO (Either SomeException (String, String, String, [String]))
+  case result of
+    Left _ -> return Nothing  -- Invalid regex, return Nothing
+    Right match@(_, matched, _, _) ->
+      if null matched
+        then return Nothing  -- No match
+        else return (Just match)
+
 -- | Replace capture group placeholders like \1, \2 with actual captured text
 substituteCaptures :: String -> String -> [String] -> String
 substituteCaptures replacement fullMatch captures = go replacement
@@ -630,9 +676,9 @@ performReplace searchPattern replaceText mwc = do
     then do
       let targetLine = fileLines !! (lineNum - 1)
           -- Use regex substitution with capture group support
-          replacedLine = case targetLine =~ searchPattern :: (String, String, String, [String]) of
-            (_, "", _, _) -> targetLine  -- No match found
-            (before, matched, after, captures) ->
+          replacedLine = case safeRegexMatch searchPattern targetLine of
+            Nothing -> targetLine  -- Invalid regex or no match
+            Just (before, matched, after, captures) ->
               let substituted = substituteCaptures replaceText matched captures
                in before ++ substituted ++ after
           modifiedLines = take (lineNum - 1) fileLines ++ [replacedLine] ++ drop lineNum fileLines
@@ -672,9 +718,9 @@ performReplaceAll searchPattern replaceText matches = do
     replaceLines _ _ [] _ _ = []
     replaceLines pattern replacement (line:rest) targets currentLine =
       let newLine = if currentLine `elem` targets
-                      then case line =~ pattern :: (String, String, String, [String]) of
-                        (_, "", _, _) -> line  -- No match
-                        (before, matched, after, captures) ->
+                      then case safeRegexMatch pattern line of
+                        Nothing -> line  -- Invalid regex or no match
+                        Just (before, matched, after, captures) ->
                           let substituted = substituteCaptures replacement matched captures
                            in before ++ substituted ++ after
                       else line
@@ -735,7 +781,8 @@ runSearchResultsTUI matches pattern path exts types = do
         { spPattern = if null patternText then pattern else patternText,
           spPath = if null pathText then "." else pathText,
           spExtensions = exts',
-          spSearchTypes = types'
+          spSearchTypes = types',
+          spModifiedFiles = finalState ^. modifiedFiles
         }
 
   return (fromMaybe Quit (finalState ^. resultAction), params)
@@ -763,7 +810,8 @@ runSearchResultsTUIWithAsync previousMatches pattern path exts types searchActio
         { spPattern = if null patternText then pattern else patternText,
           spPath = if null pathText then "." else pathText,
           spExtensions = exts',
-          spSearchTypes = types'
+          spSearchTypes = types',
+          spModifiedFiles = finalState ^. modifiedFiles
         }
 
   return (fromMaybe Quit (finalState ^. resultAction), params)
@@ -794,6 +842,7 @@ runInteractiveTUI _opts = do
         { spPattern = patternText,
           spPath = if null pathText then "." else pathText,
           spExtensions = exts,
-          spSearchTypes = types
+          spSearchTypes = types,
+          spModifiedFiles = []  -- No files modified yet in interactive mode
         }
     _ -> return Nothing  -- User quit without searching

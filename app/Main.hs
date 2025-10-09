@@ -4,13 +4,15 @@ module Main where
 
 import Brick.BChan (BChan, newBChan, writeBChan)
 import Control.Concurrent (forkIO)
-import Control.DeepSeq (force)
+import Control.Concurrent.Async (mapConcurrently, mapConcurrently_)
+import Control.DeepSeq (NFData, force)
 import Control.Exception (evaluate)
 import Control.Monad (filterM, foldM, forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
+import Control.Parallel.Strategies (parMap, rdeepseq)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, isPrefixOf, isSuffixOf)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -26,7 +28,7 @@ import System.Exit (exitSuccess, exitWith)
 import System.FilePath (takeExtension, takeFileName)
 import System.FilePath qualified as FP
 import System.IO (hFlush, stdout)
-import TUI (AppEvent (..), MatchWithContext (..), ResultsAction (..), SearchParams (..), runInteractiveTUI, runSearchResultsTUI, runSearchResultsTUIWithAsync, spExtensions, spPath, spPattern, spSearchTypes)
+import TUI (AppEvent (..), MatchWithContext (..), ResultsAction (..), SearchParams (..), runInteractiveTUI, runSearchResultsTUI, runSearchResultsTUIWithAsync, spExtensions, spModifiedFiles, spPath, spPattern, spSearchTypes)
 import TreeSitter.Tree (Tree)
 
 -- | Cached AST data for a file
@@ -39,6 +41,19 @@ data CachedAST = CachedAST
 
 -- | AST cache mapping file paths to their parsed trees
 type ASTCache = Map FilePath CachedAST
+
+-- | Update cache for files that have been modified
+-- Re-parses the files and updates the cache
+updateCacheForModifiedFiles :: [FilePath] -> ASTCache -> Options -> IO ASTCache
+updateCacheForModifiedFiles modifiedFiles cache opts = do
+  foldM updateFile cache modifiedFiles
+  where
+    updateFile :: ASTCache -> FilePath -> IO ASTCache
+    updateFile currentCache filepath = do
+      maybeNewCached <- cacheFile opts filepath
+      case maybeNewCached of
+        Just newCached -> return $ Map.insert filepath newCached currentCache
+        Nothing -> return currentCache -- Keep old cache if re-parsing fails
 
 data Options = Options
   { searchPattern :: Maybe String,
@@ -194,21 +209,17 @@ runSearchWithCacheAndResults params maybeCache previousResults = do
   -- Create IORef to capture the built cache
   cacheRef <- newIORef maybeCache
 
-  -- Create async search action that builds cache if needed, then searches
+  -- Create async search action that streams results as files are parsed
   let searchAction chan = do
-        -- Build cache if needed
-        cache <- case maybeCache of
-          Just c -> return c
+        case maybeCache of
+          Just cache -> do
+            -- Have cache, use it
+            let matchesWithContext = searchCachedASTs cache (spPattern params) (spSearchTypes params)
+            writeBChan chan (SearchComplete matchesWithContext)
           Nothing -> do
-            newCache <- buildASTCacheWithProgress searchOpts (spPath params) chan
-            writeIORef cacheRef (Just newCache)
-            return newCache
-
-        -- Perform search on cached ASTs
-        let matchesWithContext = searchCachedASTs cache (spPattern params) (spSearchTypes params)
-
-        -- Send results
-        writeBChan chan (SearchComplete matchesWithContext)
+            -- No cache, stream results file-by-file for faster perceived speed
+            streamSearchResults searchOpts (spPath params) (spPattern params) (spSearchTypes params) chan
+            writeIORef cacheRef Nothing -- Don't cache for now in streaming mode
 
   -- Run TUI with async search
   (action, newParams) <-
@@ -228,8 +239,84 @@ runSearchWithCacheAndResults params maybeCache previousResults = do
       -- Check if we need to rebuild cache
       if spPath newParams /= spPath params || spExtensions newParams /= spExtensions params
         then runSearchWithCacheAndResults newParams Nothing []
-        else runSearchWithCacheAndResults newParams finalCache [] -- Pass the cache!
+        else do
+          -- Update cache for modified files only
+          updatedCache <- case finalCache of
+            Nothing -> return Nothing
+            Just cache ->
+              if null (spModifiedFiles newParams)
+                then return (Just cache)
+                else do
+                  let searchOpts =
+                        Options
+                          { searchPattern = Just (spPattern newParams),
+                            searchTypes = spSearchTypes newParams,
+                            targetPath = spPath newParams,
+                            fileExtensions = spExtensions newParams,
+                            tuiMode = True
+                          }
+                  newCache <- updateCacheForModifiedFiles (spModifiedFiles newParams) cache searchOpts
+                  return (Just newCache)
+          runSearchWithCacheAndResults newParams updatedCache []
     Quit -> return ()
+
+-- | Stream search results file-by-file (faster perceived speed than building cache first)
+streamSearchResults :: Options -> FilePath -> String -> [SearchType] -> BChan AppEvent -> IO ()
+streamSearchResults opts path pattern searchTypes chan = do
+  isFile <- doesFileExist path
+  isDir <- doesDirectoryExist path
+
+  allMatches <- newIORef []
+
+  if isFile
+    then streamSearchFile opts path pattern searchTypes allMatches chan
+    else
+      if isDir
+        then streamSearchDirectory opts path pattern searchTypes allMatches chan
+        else return ()
+
+  -- Send final results
+  matches <- readIORef allMatches
+  writeBChan chan (SearchComplete matches)
+
+streamSearchDirectory :: Options -> FilePath -> String -> [SearchType] -> IORef [MatchWithContext] -> BChan AppEvent -> IO ()
+streamSearchDirectory opts dir pattern searchTypes matchesRef chan = do
+  entries <- listDirectory dir
+  gitignorePatterns <- readGitignore (dir FP.</> ".gitignore")
+
+  let filteredEntries = filter (not . shouldIgnore gitignorePatterns) entries
+      fullPaths = map (dir FP.</>) filteredEntries
+
+  files <- filterM doesFileExist fullPaths
+  dirs <- filterM doesDirectoryExist fullPaths
+
+  -- Search files in parallel
+  mapConcurrently_ (\file -> streamSearchFile opts file pattern searchTypes matchesRef chan) files
+
+  -- Search subdirectories
+  forM_ dirs $ \subdir -> streamSearchDirectory opts subdir pattern searchTypes matchesRef chan
+
+streamSearchFile :: Options -> FilePath -> String -> [SearchType] -> IORef [MatchWithContext] -> BChan AppEvent -> IO ()
+streamSearchFile opts file pattern searchTypes matchesRef chan = do
+  let ext = takeExtension file
+      shouldSearchFile = null (fileExtensions opts) || ext `elem` fileExtensions opts
+
+  when shouldSearchFile $ do
+    case languageForExtension ext of
+      Nothing -> return ()
+      Just lang -> do
+        content <- BS.readFile file
+        let fileLines = lines (BS8.unpack content)
+        case parseFile lang content of
+          Left _err -> return ()
+          Right tree -> do
+            let matches = findMatches searchTypes pattern tree content
+                matchesWithContext = map (createMatchWithContext file fileLines) matches
+            -- Add to accumulator
+            atomicModifyIORef' matchesRef (\ms -> (ms ++ matchesWithContext, ()))
+            -- Send incremental update
+            currentMatches <- readIORef matchesRef
+            writeBChan chan (SearchComplete currentMatches)
 
 -- | Build AST cache with progress updates sent via BChan
 buildASTCacheWithProgress :: Options -> FilePath -> BChan AppEvent -> IO ASTCache
@@ -303,24 +390,26 @@ cacheDirectoryWithProgressHelper opts dir chan currentCount totalFiles = do
   files <- filterM doesFileExist fullPaths
   dirs <- filterM doesDirectoryExist fullPaths
 
-  -- Cache files with progress
-  (fileCaches, newCount) <-
-    foldM
-      ( \(caches, count) file -> do
+  -- Create progress counter
+  countRef <- newIORef currentCount
+
+  -- Cache files in parallel with progress updates
+  fileCaches <-
+    mapConcurrently
+      ( \file -> do
+          count <- atomicModifyIORef' countRef (\c -> (c + 1, c))
           maybeCache <- cacheFileWithProgress opts file chan count totalFiles
-          let newCount = count + 1
-          return
-            ( case maybeCache of
-                Just cache -> Map.singleton file cache : caches
-                Nothing -> caches,
-              newCount
-            )
+          return $ case maybeCache of
+            Just cache -> Map.singleton file cache
+            Nothing -> Map.empty
       )
-      ([], currentCount)
       files
 
-  -- Cache subdirectories (pass count through recursively)
-  (dirCaches, finalCount) <-
+  -- Get final count after all files
+  newCount <- readIORef countRef
+
+  -- Cache subdirectories (still need sequential for correct count)
+  (dirCaches, _finalCount) <-
     foldM
       ( \(caches, count) subdir -> do
           cache <- cacheDirectoryWithProgressHelper opts subdir chan count totalFiles
@@ -391,15 +480,19 @@ cacheDirectory opts dir = do
   files <- filterM doesFileExist fullPaths
   dirs <- filterM doesDirectoryExist fullPaths
 
-  -- Cache files
-  fileCaches <- forM files $ \file -> do
-    maybeCache <- cacheFile opts file
-    return $ case maybeCache of
-      Just cache -> Map.singleton file cache
-      Nothing -> Map.empty
+  -- Cache files in parallel for speed
+  fileCaches <-
+    mapConcurrently
+      ( \file -> do
+          maybeCache <- cacheFile opts file
+          return $ case maybeCache of
+            Just cache -> Map.singleton file cache
+            Nothing -> Map.empty
+      )
+      files
 
-  -- Cache directories
-  dirCaches <- forM dirs $ \subdir -> cacheDirectory opts subdir
+  -- Cache directories recursively (also in parallel)
+  dirCaches <- mapConcurrently (\subdir -> cacheDirectory opts subdir) dirs
 
   return $ Map.unions (fileCaches ++ dirCaches)
 

@@ -1,8 +1,8 @@
 def cat()->None:
     pass
 
-cat = "oliver"
-pet = "snoopdoggdoggggggy"
+cat = "oliver twist is amazing"
+pet = ""
 
 lookup = {
     cat: pet
